@@ -12,7 +12,7 @@
     {
       "name": "axon",
       "source": "./",
-      "description": "Semantic, tree-first computer use for Windows. Drives desktop apps through the UI Automation accessibility tree instead of screenshots, so targeting is precise, DPI-proof, and about 20x cheaper in tokens. Adds to Claude Code's built-in computer use; never replaces it.",
+      "description": "Semantic computer use for Windows and macOS. Reads apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs ~23x fewer tokens. Knows the difference between your input and its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
       "version": "0.1.0",
       "author": {
         "name": "ridelink0",

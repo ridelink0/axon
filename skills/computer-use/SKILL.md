@@ -1,14 +1,15 @@
 ---
 name: axon-computer-use
-description: Use when driving Windows desktop applications - clicking buttons, filling fields, reading windows, testing a GUI, or automating an app that has no CLI or API. Covers the tree-first workflow, the permission model, and when pixels are actually needed.
+description: Use when driving desktop applications on Windows or macOS - clicking buttons, filling fields, reading windows, testing a GUI, or automating an app with no CLI or API. Covers the tree-first workflow, working alongside the user on their own desktop, the permission model, and when pixels are actually needed.
 ---
 
-# Driving Windows apps with Axon
+# Driving desktop apps with Axon
 
-Axon reads and controls Windows applications through the UI Automation
-accessibility tree. It is separate from Claude Code's built-in `computer-use`
-server and does not replace it. On Windows the built-in CLI computer use does
-not exist at all, so Axon is the only screen-control path there.
+Axon reads and controls applications through the OS accessibility tree - UI
+Automation on Windows, AXUIElement on macOS. It is separate from Claude Code's
+built-in `computer-use` server and does not replace it. On Windows the built-in
+CLI computer use does not exist at all, so Axon is the only screen-control path
+there.
 
 ## The one rule that matters
 
@@ -58,6 +59,44 @@ snapshot instead.
   with a character count.
 - `with_rects: true` - adds bounding boxes. Only needed for point targeting.
 
+## You are sharing the machine with someone
+
+The user is probably sitting right there, working, on this same desktop. Axon
+can tell your input from theirs - the OS flags every synthetic event and Axon
+reads that flag - so behave accordingly.
+
+**Most of what you do they will never feel.** Reading a window touches nothing.
+Invoking a control through its accessibility pattern touches nothing: no cursor
+movement, no focus change, and it works on windows sitting behind others. Prefer
+those, always, and you can work continuously without ever interrupting them.
+
+Only two things intrude: **moving the pointer** and **taking the foreground**.
+Axon gates exactly those. In the default `share` mode it waits for a gap in
+their typing, borrows the pointer, and puts it back. You will see
+`Waited 340ms for the user to pause first.` in the result when that happened -
+that is normal, not an error.
+
+Three signals tell you they are around:
+
+- A `[user present: ...]` line at the top of a snapshot. It only appears when
+  they are actually active, so if you do not see it, the machine is yours.
+- `waited_for_user_ms` in an action result.
+- `axon_status`, which reports idle time, mode, and the event counts.
+
+Two refusals you should expect and handle gracefully:
+
+| code | what to do |
+|---|---|
+| `user_in_window` | They are typing in that exact window. Do something else and come back; do not fight them for it. |
+| `user_busy` | You needed the cursor and they never stopped. Do the reading and pattern-based parts of the job now, and retry this step later. |
+
+Pass `mode: "take"` only when the user has actually asked you to drive the
+screen while they watch. It interrupts them.
+
+When you do have to interrupt, say so in your reply. "I waited for you to stop
+typing" or "I need the pointer for this step, so you will see it move" costs one
+sentence and stops it feeling like the machine misbehaving.
+
 ## Acting reliably
 
 `axon_click` prefers the element's accessibility pattern over moving the mouse.
@@ -85,6 +124,8 @@ Errors are typed, so branch on the code rather than the prose:
 | `app_blocked` | credential or elevation surface - not configurable |
 | `wait_timeout` | it never appeared - snapshot to see what is actually there |
 | `window_minimized` | call `axon_focus` first |
+| `user_in_window` | the user is working in that window - go elsewhere |
+| `user_busy` | they never paused - do the tree-only parts now, retry later |
 
 ## Permissions
 
@@ -122,7 +163,8 @@ excluded from listings entirely so its own output cannot loop back to you.
   spare window" by killing a PID can destroy an unrelated document.
 - Input goes to the real desktop. Unlike the tree, which reads background
   windows fine, clicking and typing need the window in front. `axon_focus`
-  first, and expect the user's cursor and focus to move.
+  first, and expect the user's cursor and focus to move - which is exactly why
+  the pattern path is worth preferring.
 - Snapshots read background windows without raising them. If you only need to
   *look*, do not focus anything.
 - Some apps annotate their own quirks. When a snapshot or grant comes back with

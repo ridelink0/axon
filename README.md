@@ -1,58 +1,124 @@
-# Axon
+# axon
 
-**Semantic computer use for Windows, as a Claude Code plugin.**
-
-Axon lets Claude drive Windows desktop applications by reading their
-accessibility tree — the same structured data screen readers use — instead of
-squinting at screenshots. Targeting becomes exact, DPI-proof, and roughly
-**20x cheaper in tokens**.
-
-It **adds to** Claude Code's built-in computer use. It does not wrap, patch, or
-replace it. On Windows there is nothing to replace: [Claude Code's CLI computer
-use is macOS-only](https://code.claude.com/docs/en/computer-use). Axon fills
-that gap.
+Semantic computer use for Claude Code, on Windows and macOS.
 
 ---
 
-## Why tree-first
+## Read this before you install it
 
-Most computer-use agents work like this: screenshot → model looks at pixels →
-model guesses coordinates → click. That is expensive, fragile, and blind to
-anything scrolled out of view.
-
-Axon works like this: read the UI Automation tree → target an element by
-identity → invoke its accessibility pattern. No pixels involved unless you ask.
-
-Measured on the reference test window in this repo:
-
-| | tokens | notes |
-|---|---:|---|
-| `axon_snapshot` of a window | **~459** | every element, with names, ids, states, and text |
-| `axon_snapshot` interactive only | **~405** | just what you can act on |
-| `axon_screenshot` of the same window | **~10,153** | one JPEG, downscaled, q60 |
-
-**22x.** Reproduce it yourself with `node tools/mcp-test.mjs`, which prints the
-cost summary at the end of every run.
-
-The tree is also *better*, not just cheaper:
-
-- **Exact identity.** `IUIAutomationElement.FindFirst` + pattern invoke resolves
-  in single-digit milliseconds. No coordinate guessing, no missed clicks.
-- **DPI, theme, and resolution proof.** Selectors carry semantic identity
-  (role, AutomationId, name), so nothing breaks at 125% scaling or in dark mode.
-- **Sees what pixels cannot.** A snapshot includes text scrolled *outside* the
-  viewport. A screenshot by definition cannot.
-- **Works on background windows.** Reading a window's tree does not raise it or
-  steal your focus.
-- **Fails loudly.** A stale element returns `element_stale`, not a click at
-  whatever now occupies those coordinates.
-
-Vision still wins for canvas-drawn surfaces — image editors, games, charts,
-design tools — so `axon_screenshot` is there when the tree genuinely cannot
-help. That split is the whole design: route each look to the cheapest surface
-that can actually answer it.
+> **WARNING — this plugin lets Claude control your computer. It clicks real
+> buttons in your real applications and types into your real documents.**
+>
+> There is no undo. If Claude clicks Delete, the thing is deleted. If it types
+> into the wrong window, that text is in the wrong window. If a web page you
+> told it to read contains text designed to fool it, it has been fooled while
+> holding your mouse.
+>
+> **Only install this if all of these are true:**
+>
+> - You are comfortable with software that moves your cursor and presses keys.
+> - You will be at the machine, watching, the first several times you use it.
+> - The work you care about is saved, committed, or backed up first.
+> - You are the owner of this computer and nobody else's data is on it.
+>
+> **Do not install this** on a work machine you do not administer, on a machine
+> holding anyone else's data, or on anything you would not hand to a careful but
+> literal-minded stranger for ten minutes.
+>
+> Axon refuses to touch password managers, UAC prompts and login screens, and it
+> has no ability to kill a process. Those limits are real and they are enforced
+> in code. They are not a substitute for supervising it.
+>
+> MIT licensed, which means no warranty. If it breaks something, that is on you.
 
 ---
+
+Most computer-use agents look at **pixels**. They take a screenshot, ask a model
+to find the button in the picture, and click where it guesses. That is expensive,
+it breaks when you change your display scaling, and it cannot see anything that
+is scrolled out of view.
+
+This one reads the **accessibility tree** — the same structured data a screen
+reader uses. It gets the real name and identity of every control, so it does not
+guess coordinates, and it can invoke a button through its own accessibility
+action without moving your mouse at all.
+
+That last part is what makes the next bit possible.
+
+## It gets out of your way
+
+You can keep working while it works. Same desktop, same keyboard, same mouse.
+
+Windows stamps every synthetic input event with a flag in the kernel that the
+injecting process cannot clear. So Axon can tell, exactly and continuously, which
+input came from you and which came from itself. macOS gets the same thing a
+different way.
+
+It shows you what it touched, too: a small marker in your accent colour flashes
+around each control as it acts. Axon never touches your system cursor, so it
+cannot leave it in a bad state, which is the [standing Codex bug on
+Windows](https://github.com/openai/codex/issues/25200). The marker is
+click-through, never takes focus, stays out of alt-tab, and is excluded from
+screen capture so Axon never photographs its own UI. `AXON_OVERLAY=off` if you
+would rather not see it.
+
+Once it knows that, it can behave:
+
+- Reading a window never touches your input at all, so it can look at anything
+  any time, including windows that are behind others.
+- Pressing a button through its accessibility action does not move your cursor
+  or steal your focus, so most of what it does you will never feel.
+- When it genuinely needs the pointer, it waits for a gap in your typing, takes
+  it, and puts the pointer back where you left it.
+- If you are actively typing in a window, it will not touch that window. It goes
+  and does something else.
+
+If the input hooks it uses are blocked - security tooling sometimes throttles a
+freshly compiled unsigned binary that installs global hooks - it falls back to a
+hook-free idle check and says which one it is using in `axon_status`. It never
+pretends to know you are there when it does not.
+
+Measured during the test suite: Axon fired 36 input events, and the presence
+tracker counted **zero** user activity from them.
+
+```
+injected +36, real +0, idle now 3443ms
+```
+
+That is the whole feature in one line. It knows the difference.
+
+Codex does not do this on Windows. Its own documentation says so:
+
+> "On Windows, the model is simpler and more constrained: Codex takes over the
+> foreground, and you cannot use the same desktop session while a Computer Use
+> task runs."
+
+There is no idle detection and no user-disturbance prevention there. On macOS it
+solves the problem the other way, with a sandboxed second session. Axon solves it
+on the shared desktop, on both.
+
+## The cost difference
+
+| | tokens |
+|---|---:|
+| Reading a window as a tree | **~457** |
+| The same window as a screenshot | **~10,600** |
+
+**Twenty-three times.** Run `node tools/mcp-test.mjs`; it prints this at the end
+of every run, on your machine, with your windows.
+
+And the tree is not just cheaper, it is better:
+
+| Screenshot | Tree |
+| --- | --- |
+| Guesses coordinates from pixels | Knows the control's name and id |
+| Breaks at 125% display scaling | Scaling makes no difference |
+| Sees only what is visible | Includes text scrolled out of view |
+| Needs the window in front | Reads windows sitting behind others |
+| A wrong guess clicks the wrong thing | A dead element returns `element_stale` |
+
+Pixels still win for canvas apps — image editors, games, charts, design tools —
+so `axon_screenshot` is there. It is just not the default any more.
 
 ## Install
 
@@ -61,140 +127,118 @@ that can actually answer it.
 /plugin install axon@axon
 ```
 
-Requires **Windows** and **Node 18+**. Nothing else — no npm install, no Python,
-no native addon, no download.
+Windows or macOS, and Node 18+. Nothing else. No npm install, no Python, no
+native module, no download.
 
-### How the host is built
+The host is a small program that talks to the OS accessibility API. On first run
+it is compiled on your machine by a compiler you already have — `csc.exe` from
+the .NET Framework on Windows, `swiftc` from the Xcode tools on macOS.
 
-Axon's host is a small C# program that talks to the UI Automation COM API. On
-first run it is compiled locally by `csc.exe`, the C# compiler that ships inside
-every Windows .NET Framework install, into your plugin data directory.
-
-It is shipped as **source, not a binary** — [`server/native/AxonHost.cs`](server/native/AxonHost.cs)
-is the whole thing, and what runs on your machine is exactly what you can read
-there. The build is content-addressed, so it happens once and is a no-op after.
-
-If the build fails, run `/axon:doctor`, or `node server/build.mjs --force` from
-the plugin directory to see the compiler's own output.
-
----
+It ships as **source, not a binary**. What runs on your machine is exactly what
+you can read in `server/native/`. Nothing is downloaded.
 
 ## Using it
 
 ```
-axon_apps                                  find the window, note its hwnd
-axon_snapshot { hwnd }                     read it — every element gets an index
-axon_grant { hwnd }                        only needed to act, not to read
+axon_apps                                find the window, note its hwnd
+axon_snapshot { hwnd }                   read it, every element gets an index
+axon_grant { hwnd }                      needed to act, never to read
 axon_click { index: 12 }
-axon_type { index: 5, text: "…", replace: true }
-axon_wait_for { hwnd, selector: { name: "Done" } }
+axon_type { index: 5, text: "...", replace: true }
 ```
 
-Full tool list: `axon_apps`, `axon_snapshot`, `axon_screenshot`, `axon_grant`,
-`axon_focus`, `axon_click`, `axon_type`, `axon_key`, `axon_scroll`,
-`axon_wait_for`, `axon_close_window`, `axon_status`.
+Every acting tool takes a `mode`:
 
-The bundled skill teaches Claude the tree-first discipline, the targeting
-hierarchy, and the error codes. The always-on cost of all twelve tool schemas is
-about **1,200 tokens** — deliberately terse, with the teaching moved into the
-skill so you only pay for it when it is used.
+| mode | what it does |
+| --- | --- |
+| `share` | default. Waits for a gap before using your cursor or focus. |
+| `yield` | refuses outright while you are active. |
+| `take` | interrupts you. For when you asked it to drive and are watching. |
 
----
+Twelve tools, about **1,360 tokens** of always-on cost. One screenshot you did
+not take pays for that eight times over.
 
-## Safety
+## What it will not do
 
-Axon is deliberately narrower than it could be.
-
-**Reading is free; acting needs a grant.** Every click, keystroke, and window
-close requires `axon_grant` for that app, and grants last only for the session.
-Reading a window never implies permission to touch it.
-
-**Four tiers, and two of them are not negotiable:**
+Reading is free. Acting needs a grant, per app, for that session only.
 
 | tier | behaviour |
-|---|---|
+| --- | --- |
 | `standard` | grant and go |
-| `sensitive` | grantable, but the grant tells Claude what that app reaches — browsers carry every signed-in session, Explorer can delete anything |
-| `shell` | terminals and editors: **readable, never typeable**. Anything typed there runs as you |
-| `blocked` | password managers, UAC prompts, login screens: **not even readable**, because their accessibility tree contains the secrets in plain text |
+| `sensitive` | grantable, but it tells Claude what that app reaches. A browser carries every session you are signed in to. |
+| `shell` | terminals and editors. Readable, **never typeable** — anything typed there runs as you. |
+| `blocked` | password managers, UAC prompts, login screens. **Not even readable**, because their accessibility tree has the secrets in plain text. |
 
-**Axon cannot kill a process.** There is no such tool, by design.
-`axon_close_window` sends `WM_CLOSE` to one specific window — the same thing
-clicking its X does — so the app can still prompt to save. This exists because
-of a real incident during development: terminating what looked like a spare
-Notepad launcher destroyed an unrelated unsaved document, since Windows 11
-Notepad shares one process across every window. Killing a PID discards work
-without asking. Axon will not do it.
+**It cannot kill a process.** There is no such tool. `axon_close_window` asks one
+window to close, exactly as clicking its X does, so the app can still offer to
+save.
 
-**Your Claude Code session is excluded** from listings and captures, so
-on-screen text from the session cannot loop back into the model as if it were
-observed content.
+That one is there because of a real accident while building this. Terminating
+what looked like a spare Notepad launcher destroyed an unrelated unsaved note,
+because Windows 11 Notepad runs every window inside one shared process. A PID is
+not a window. Axon does not get to make that mistake.
 
-**On-screen text is treated as untrusted data.** Shell-tier reads carry an
-explicit warning, and the skill instructs Claude to treat every string from a
-window as information about the world, never as instructions.
-
-Add your own blocked apps in the plugin's settings (`blocked_apps`). That list
-is additive — it can extend the built-in blocklist, never shrink it.
-
----
+Your Claude Code session is excluded from its own listings, so text on your
+screen cannot loop back into the model as if it had observed it. Add your own
+blocked apps in the plugin settings; that list only ever grows.
 
 ## What it does not do
 
-Being straight about the gaps:
+- **Linux.** Would need an AT-SPI driver. Does not exist yet.
+- **Canvas apps.** Roughly one target in twenty has no accessible structure.
+  Use `axon_screenshot` and point targeting there.
+- **No elevation, no UAC, no process control.** Deliberate.
+- **macOS is a port I could not test.** See below.
 
-- **Windows only.** The whole design sits on Windows UI Automation. On macOS,
-  use Claude Code's built-in computer use.
-- **Foreground input.** Reading works on background windows; clicking and typing
-  do not. Axon moves the real cursor and focus, so you will see it working.
-  OpenAI's Codex has background computer use with an isolated cursor on macOS —
-  and notably [not on Windows either](https://learn.chatgpt.com/docs/computer-use),
-  where it also takes over the active desktop. Axon does not pretend otherwise.
-- **Canvas apps need pixels.** Roughly 5% of targets — games, image editors,
-  design tools — have no accessible structure. Use `axon_screenshot` and point
-  targeting there.
-- **No process control, no elevation, no UAC.** Not oversights.
+## About the macOS host
 
----
+Straight about this: the Windows host has 190 tests and I have driven real
+applications with it end to end. The macOS host was written on a Windows machine
+and has never been compiled or run.
 
-## Development
+The design is sound — same protocol, AXUIElement instead of UI Automation, a
+listen-only event tap instead of low-level hooks — but sound is not tested.
+
+Before trusting it:
 
 ```
-node tools/test-all.mjs        all 171 tests
-node tools/policy-test.mjs      57  safety model: tiers, grants, refusals
-node tools/build-test.mjs       13  local compile: cold build, idempotence, concurrent builds
-node tools/host-test.mjs        52  compiled host: tree, patterns, input, crash recovery
-node tools/mcp-test.mjs         49  MCP protocol end to end; prints the token cost summary
-node server/build.mjs --force       rebuild the host
+node server/build.mjs --self-test
 ```
 
-The host and MCP suites create their own throwaway target window and never
-touch a pre-existing app. Beyond the happy paths they cover the things that
-actually bite: stale snapshot indices, a dead host mid-session, five concurrent
-calls, a window covered by another window, minimized windows, two sessions
-compiling the host at the same time, and every typed error code.
+If it does not compile you get the compiler's own output, not a mystery. If that
+happens, [open an issue](https://github.com/ridelink0/axon/issues) with it and I
+will fix it.
 
-There is also a behavioural eval (`claude plugin eval axon`) checking that
-Claude reaches for the tree rather than a screenshot.
+## Tests
 
----
+```
+node tools/test-all.mjs        all 196
+node tools/policy-test.mjs      57  tiers, grants, refusals
+node tools/presence-test.mjs    25  telling you apart from Axon, overlay, modes
+node tools/build-test.mjs       13  compile, idempotence, concurrent builds
+node tools/host-test.mjs        52  tree, patterns, input, crash recovery
+node tools/mcp-test.mjs         49  the protocol end to end, prints token costs
+```
 
-## Prior art and credit
+They build their own throwaway window and never touch anything already open.
+Past the happy paths they cover stale indices, a host killed mid-session, five
+concurrent calls, a window covered by another window, minimized windows, two
+sessions compiling at once, and every error code.
 
-The architecture is a deliberate study of what makes OpenAI Codex's computer use
-good, rebuilt from scratch for Windows and for Claude Code.
+## Where the idea came from
 
-That lineage runs through **Sky** (Software Applications Incorporated, acquired
-by OpenAI in October 2025) and before it **Workflow**, which became Apple
-Shortcuts. Sky's insight was that an agent should know what actions an app
-*affords*, not just what pixels it is showing — reading window contents through
-the accessibility layer regardless of whether the window is in front. Its
-"Skyshot" (window image **plus** a textual representation of the window) became
-Codex's "Appshot", and is the direct ancestor of `axon_snapshot`. The `app notes`
-attached to grants are a scaled-down version of the same action-catalog idea.
+This is a study of what makes Codex's computer use good, rebuilt from scratch.
 
-Axon shares no code with any of them.
+The lineage runs through **Sky** (Software Applications Incorporated, bought by
+OpenAI in October 2025) and before it **Workflow**, which became Apple Shortcuts.
+Sky's insight was that an agent should know what actions an app *affords*, not
+just what pixels it is showing, and that it should read a window whether or not
+that window is in front. Its "Skyshot" — a picture of a window plus a textual
+representation of it — became Codex's "Appshot", and is the direct ancestor of
+`axon_snapshot`.
+
+No code is shared with any of them.
 
 ## License
 
-MIT
+MIT. No warranty. Read the warning at the top again.

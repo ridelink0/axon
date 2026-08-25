@@ -22,6 +22,33 @@ policy.markSelf([process.pid, process.ppid]);
 // them so the model can see what it is spending and prefer trees.
 const budget = { shots: 0, shotBytes: 0, snapshots: 0 };
 
+// Presence is read constantly, so it is cached for a moment. The host is cheap
+// to ask, but not free, and this runs on every action.
+let presenceCache = null;
+let presenceAt = 0;
+
+async function presence({ fresh = false } = {}) {
+  if (!fresh && Date.now() - presenceAt < 400 && presenceCache) return presenceCache;
+  try {
+    const { result } = await driver.call('presence', {}, { timeoutMs: 4000 });
+    presenceCache = result;
+    presenceAt = Date.now();
+    return result;
+  } catch {
+    return presenceCache || { monitoring: false };
+  }
+}
+
+// Claude should not have to ask whether the user is around: when they are, it
+// is stated. When they are not, nothing is said and nothing is spent.
+function presenceNote(p) {
+  if (!p || !p.monitoring) return '';
+  if (!p.user_active) return '';
+  const what = p.last_input === 'keyboard' ? 'typing' : 'moving the mouse';
+  return `[user present: ${what} ${p.idle_ms}ms ago. Reading and pattern-based actions are unaffected; anything needing the cursor or foreground will wait for a gap.]
+`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -41,7 +68,14 @@ const SELECTOR = {
 
 // index+snapshot_id is the preferred targeting path; selector needs hwnd;
 // point is the escape hatch for canvas UI.
+const MODE = {
+  type: 'string',
+  enum: ['share', 'yield', 'take'],
+  description: 'Behaviour while the user is active. Default share.',
+};
+
 const TARGET = {
+  mode: MODE,
   index: int,
   snapshot_id: str,
   selector: SELECTOR,
@@ -83,7 +117,7 @@ const TOOLS = [
   {
     name: 'axon_focus',
     description: 'Raise a window and restore it if minimized.',
-    inputSchema: { type: 'object', properties: { hwnd: int, title: str } },
+    inputSchema: { type: 'object', properties: { hwnd: int, title: str, mode: MODE } },
   },
   {
     name: 'axon_click',
@@ -103,7 +137,7 @@ const TOOLS = [
   {
     name: 'axon_key',
     description: 'Send one key chord: "ctrl+s", "alt+f4", "enter", "f5".',
-    inputSchema: { type: 'object', required: ['keys', 'hwnd'], properties: { keys: str, hwnd: int } },
+    inputSchema: { type: 'object', required: ['keys', 'hwnd'], properties: { keys: str, hwnd: int, mode: MODE } },
   },
   {
     name: 'axon_scroll',
@@ -240,11 +274,17 @@ const handlers = {
     } catch (e) {
       host = 'error: ' + e.message;
     }
+    const p = await presence({ fresh: true });
     const grants = policy.listGrants();
     const lines = [
       `host: ${host}`,
       `dpi mode: ${dpi}`,
       `platform: ${process.platform}`,
+      '',
+      `coexistence: ${p.monitoring ? 'monitoring' : 'UNAVAILABLE (input hooks did not install; Axon cannot tell you apart from itself and will not wait for you)'}`,
+      p.monitoring ? `  user ${p.user_active ? 'ACTIVE - last input ' + p.idle_ms + 'ms ago (' + p.last_input + ')' : 'idle for ' + p.idle_ms + 'ms'}` : '',
+      p.monitoring ? `  mode ${p.mode}, idle threshold ${p.idle_threshold_ms}ms` : '',
+      p.monitoring ? `  events seen: ${p.real_events} from the user, ${p.injected_events} from Axon` : '',
       '',
       `snapshots taken: ${budget.snapshots}`,
       `screenshots taken: ${budget.shots} (${Math.round(budget.shotBytes / 1024)} KB of JPEG, roughly ${Math.round((budget.shotBytes * 1.37) / 4)} tokens)`,
@@ -304,7 +344,7 @@ const handlers = {
     lastSnapshotId = result.snapshot_id;
     trackSnapshot(result.snapshot_id, Number(win.hwnd));
 
-    let body = injectionBanner(win) + renderSnapshot(result, {
+    let body = presenceNote(await presence()) + injectionBanner(win) + renderSnapshot(result, {
       textLimit: args.text_limit,
       withRects: !!args.with_rects,
     });
@@ -429,7 +469,25 @@ async function act(op, args, describe) {
   delete payload.title;
   payload.hwnd = Number(win.hwnd);
   const { result } = await driver.call(op, payload);
-  return text(describe(result));
+
+  let out = describe(result);
+  // The host reports what the element looks like now, so Claude can verify the
+  // action landed without spending a second call to find out.
+  if (result.now) {
+    const bits = [];
+    if (result.now.text !== undefined) bits.push(JSON.stringify(result.now.text));
+    if (result.now.toggle) bits.push(`toggle=${result.now.toggle}`);
+    if (result.now.selected !== undefined) bits.push(`selected=${result.now.selected}`);
+    if (result.now.expand) bits.push(String(result.now.expand).toLowerCase());
+    if (result.now.value !== undefined) bits.push(`value=${result.now.value}`);
+    if (result.now.disabled) bits.push('disabled');
+    if (bits.length) out += ` Now: ${bits.join(', ')}.`;
+  }
+  if (result.waited_for_user_ms) {
+    out += ` Waited ${result.waited_for_user_ms}ms for the user to pause first.`;
+  }
+  if (result.cursor_restored) out += ' Pointer returned to where they left it.';
+  return text(out);
 }
 
 // ---------------------------------------------------------------------------

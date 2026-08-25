@@ -5,7 +5,9 @@
       "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"],
       "env": {
         "AXON_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
-        "AXON_BLOCKED_APPS": "${user_config.blocked_apps}"
+        "AXON_BLOCKED_APPS": "${user_config.blocked_apps}",
+        "AXON_MODE": "${user_config.coexist_mode}",
+        "AXON_IDLE_MS": "${user_config.user_idle_ms}"
       }
     }
   }

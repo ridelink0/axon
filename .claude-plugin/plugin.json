@@ -2,7 +2,7 @@
   "name": "axon",
   "displayName": "Axon",
   "version": "0.1.0",
-  "description": "Semantic, tree-first computer use for Windows. Drives desktop apps through the UI Automation accessibility tree instead of screenshots, so targeting is precise, DPI-proof, and about 20x cheaper in tokens. Adds to Claude Code's built-in computer use; never replaces it.",
+  "description": "Semantic computer use for Windows and macOS. Reads apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs ~23x fewer tokens. Knows the difference between your input and its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
   "author": {
     "name": "ridelink0",
     "url": "https://github.com/ridelink0"
@@ -26,6 +26,22 @@
       "title": "Additional blocked apps",
       "description": "Comma-separated process names Axon must never read or drive, on top of its built-in blocklist. Example: myvault,internal-admin",
       "required": false
+    },
+    "coexist_mode": {
+      "type": "string",
+      "title": "Coexistence mode",
+      "required": false,
+      "default": "share",
+      "description": "share = wait for a gap in your typing before using the cursor (recommended). yield = refuse while you are active. take = interrupt you."
+    },
+    "user_idle_ms": {
+      "type": "number",
+      "title": "Idle threshold (ms)",
+      "required": false,
+      "default": 1200,
+      "min": 200,
+      "max": 30000,
+      "description": "How long you must be quiet before Axon considers the machine free."
     }
   }
 }

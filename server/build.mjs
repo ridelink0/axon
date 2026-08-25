@@ -14,7 +14,15 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-export const SOURCE = path.join(HERE, 'native', 'AxonHost.cs');
+const WIN_SOURCES = [
+  path.join(HERE, 'native', 'AxonHost.cs'),
+  path.join(HERE, 'native', 'Presence.cs'),
+  path.join(HERE, 'native', 'Overlay.cs'),
+];
+const MAC_SOURCES = [path.join(HERE, 'native', 'AxonHost.swift')];
+
+export const SOURCES = process.platform === 'darwin' ? MAC_SOURCES : WIN_SOURCES;
+export const SOURCE = SOURCES[0];
 
 export function dataDir() {
   // The compiled host lives in plugin data, not in the plugin directory, so it
@@ -33,7 +41,19 @@ export function binDir() {
 // coordinating, and a rebuild after an edit writes a new file rather than
 // overwriting one another session may be executing.
 function exeFor(stamp) {
-  return path.join(binDir(), `AxonHost-${stamp.slice(0, 16)}.exe`);
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  return path.join(binDir(), `AxonHost-${stamp.slice(0, 16)}${ext}`);
+}
+
+// Swift ships with the Xcode Command Line Tools, which `xcode-select --install`
+// provides on any Mac.
+function findSwiftc() {
+  for (const c of ['/usr/bin/swiftc', '/usr/local/bin/swiftc']) if (fs.existsSync(c)) return c;
+  try {
+    const r = spawnSync('xcrun', ['-f', 'swiftc'], { encoding: 'utf8' });
+    if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
+  } catch { /* xcrun absent */ }
+  return null;
 }
 
 function findCsc() {
@@ -72,7 +92,7 @@ function findGacAssembly(name) {
 
 function computeStamp(csc, refs) {
   const h = createHash('sha256');
-  h.update(fs.readFileSync(SOURCE));
+  for (const f of SOURCES) h.update(fs.readFileSync(f));
   h.update('\0' + csc);
   for (const r of refs) h.update('\0' + r);
   h.update('\0v2');
@@ -88,10 +108,11 @@ export class BuildError extends Error {
 }
 
 export function ensureHost({ force = false, log = () => {} } = {}) {
+  if (process.platform === 'darwin') return ensureMacHost({ force, log });
   if (process.platform !== 'win32') {
     throw new BuildError(
-      'Axon needs Windows. It drives the Windows UI Automation API directly.',
-      'On macOS use Claude Code\'s built-in computer use instead: enable `computer-use` in /mcp.'
+      'Axon runs on Windows and macOS. This looks like ' + process.platform + '.',
+      'Linux would need an AT-SPI driver, which does not exist yet.'
     );
   }
 
@@ -144,7 +165,7 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
     '-r:System.Web.Extensions.dll',
     '-r:System.Drawing.dll',
     '-r:System.Windows.Forms.dll',
-    SOURCE,
+    ...SOURCES,
   ];
 
   const res = spawnSync(csc, args, { encoding: 'utf8', windowsHide: true });
@@ -171,8 +192,22 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
   }
 
   pruneOldBuilds(exe, log);
+  warmUp(exe, log);
   log('host built at ' + exe);
   return { exe, rebuilt: true, csc };
+}
+
+// The first execution of a newly written binary is slow: a real-time antivirus
+// scan runs before it starts, and on Windows that costs seconds. Paying it here,
+// once, at build time, means the first thing Claude asks Axon to do is not
+// mysteriously slow.
+function warmUp(exe, log) {
+  try {
+    const r = spawnSync(exe, ['--warmup'], { timeout: 20000, windowsHide: true, encoding: 'utf8' });
+    if (r.error) log('warm-up skipped: ' + r.error.message);
+  } catch (err) {
+    log('warm-up skipped: ' + err.message);
+  }
 }
 
 // Superseded binaries from earlier versions of the source. A file still being
@@ -182,11 +217,61 @@ function pruneOldBuilds(keep, log) {
   let entries;
   try { entries = fs.readdirSync(binDir()); } catch { return; }
   for (const name of entries) {
-    if (!/^(AxonHost-.*\.exe|\.build-.*\.exe|AxonHost\.(exe|stamp))$/.test(name)) continue;
+    if (!/^(AxonHost-[0-9a-f]{16}(\.exe)?|\.build-.*|AxonHost\.(exe|stamp))$/.test(name)) continue;
     const full = path.join(binDir(), name);
     if (full === keep) continue;
     try { fs.unlinkSync(full); } catch { /* in use by another session */ }
   }
+}
+
+function ensureMacHost({ force = false, log = () => {} } = {}) {
+  const swiftc = findSwiftc();
+  if (!swiftc) {
+    throw new BuildError('Could not find swiftc.',
+      'Install the Xcode Command Line Tools: xcode-select --install');
+  }
+
+  const h = createHash('sha256');
+  for (const f of SOURCES) h.update(fs.readFileSync(f));
+  h.update(' ' + swiftc + ' mac-v1');
+  const stamp = h.digest('hex');
+  const exe = exeFor(stamp);
+
+  if (!force && fs.existsSync(exe)) {
+    log('host up to date');
+    return { exe, rebuilt: false, compiler: swiftc };
+  }
+
+  fs.mkdirSync(binDir(), { recursive: true });
+  log('compiling host with ' + swiftc);
+  const temp = path.join(binDir(), '.build-' + process.pid + '-' + Date.now());
+
+  const res = spawnSync(swiftc, [
+    '-O', '-o', temp,
+    '-framework', 'AppKit',
+    '-framework', 'ApplicationServices',
+    '-framework', 'CoreGraphics',
+    ...SOURCES,
+  ], { encoding: 'utf8' });
+
+  if (res.error) throw new BuildError('Could not run swiftc: ' + res.error.message, null);
+  if (res.status !== 0 || !fs.existsSync(temp)) {
+    const out = ((res.stdout || '') + (res.stderr || '')).trim();
+    throw new BuildError('Compiling the macOS host failed.',
+      out.slice(0, 2000) + String.fromCharCode(10, 10) +
+      'The macOS host is a port that has not been validated on hardware. ' +
+      'Please open an issue at https://github.com/ridelink0/axon/issues with this output.');
+  }
+  try { fs.chmodSync(temp, 0o755); } catch {}
+  try { fs.renameSync(temp, exe); }
+  catch (err) {
+    try { fs.unlinkSync(temp); } catch {}
+    if (!fs.existsSync(exe)) throw new BuildError('Could not place the compiled host: ' + err.message, null);
+  }
+  pruneOldBuilds(exe, log);
+  warmUp(exe, log);
+  log('host built at ' + exe);
+  return { exe, rebuilt: true, compiler: swiftc };
 }
 
 // Allow `node build.mjs` for a manual/diagnostic build.
@@ -194,6 +279,17 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
   try {
     const r = ensureHost({ force: process.argv.includes('--force'), log: (m) => console.log(m) });
     console.log(r.rebuilt ? 'built: ' + r.exe : 'already current: ' + r.exe);
+    if (process.argv.includes('--self-test')) {
+      // Runs the host's own check, so a user can see whether it works on their
+      // machine without involving Claude at all.
+      const t = spawnSync(r.exe, ['--self-test'], { encoding: 'utf8' });
+      process.stdout.write(t.stdout || '');
+      process.stderr.write(t.stderr || '');
+      if (process.platform === 'win32' && !(t.stdout || '').trim()) {
+        console.log('(the Windows host has no --self-test; run node tools/test-all.mjs instead)');
+      }
+      process.exit(t.status === 0 ? 0 : 1);
+    }
   } catch (e) {
     console.error(e.message);
     if (e.hint) console.error(e.hint);

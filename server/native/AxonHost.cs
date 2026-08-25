@@ -32,6 +32,7 @@ namespace Axon
         [DllImport("shcore.dll")] internal static extern int SetProcessDpiAwareness(int value);
 
         [DllImport("user32.dll")] internal static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] internal static extern bool GetCursorPos(out POINT p);
         [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
@@ -111,11 +112,13 @@ namespace Axon
             if (button == "right") f = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
             else if (button == "middle") f = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
             else f = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            Presence.NoteSelfInput();
             SendInput(1, new INPUT[] { MouseInput(f, 0) }, InputSize);
         }
 
         internal static void MouseWheel(int delta, bool horizontal)
         {
+            Presence.NoteSelfInput();
             SendInput(1, new INPUT[] { MouseInput(horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL, unchecked((uint)delta)) }, InputSize);
         }
 
@@ -133,6 +136,7 @@ namespace Axon
                     KeyInput(0, (ushort)c, KEYEVENTF_UNICODE),
                     KeyInput(0, (ushort)c, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
                 };
+                Presence.NoteSelfInput();
                 SendInput(2, pair, InputSize);
             }
         }
@@ -153,12 +157,14 @@ namespace Axon
 
         internal static void KeyDown(ushort vk)
         {
+            Presence.NoteSelfInput();
             SendInput(1, new INPUT[] { KeyInput(vk, 0, IsExtended(vk) ? KEYEVENTF_EXTENDEDKEY : 0) }, InputSize);
         }
 
         internal static void KeyUp(ushort vk)
         {
             uint f = KEYEVENTF_KEYUP | (IsExtended(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
+            Presence.NoteSelfInput();
             SendInput(1, new INPUT[] { KeyInput(vk, 0, f) }, InputSize);
         }
 
@@ -230,6 +236,7 @@ namespace Axon
         static int _snapSeq = 0;
         const int MaxSnapshots = 8;
         static string _dpiMode = "none";
+        static readonly int _selfPid = System.Diagnostics.Process.GetCurrentProcess().Id;
         static JavaScriptSerializer _js;
 
         static readonly string[] ShellClasses = new string[]
@@ -242,7 +249,32 @@ namespace Axon
 
         static int Main(string[] argv)
         {
+            // Build-time warm-up: touch the expensive machinery once so the
+            // antivirus scan and the JIT are paid for before Claude ever waits
+            // on a call, then leave.
+            bool warmup = false;
+            foreach (string s in argv) if (s == "--warmup") warmup = true;
+            if (warmup)
+            {
+                try
+                {
+                    SetDpiAwareness();
+                    AutomationElement root = AutomationElement.RootElement;
+                    root.FindAll(TreeScope.Children, Condition.TrueCondition);
+                    new JavaScriptSerializer().Serialize(new Dictionary<string, object>());
+                }
+                catch { }
+                Console.Out.WriteLine("{\"event\":\"warm\"}");
+                return 0;
+            }
+
             SetDpiAwareness();
+            if (Environment.GetEnvironmentVariable("AXON_PRESENCE") != "off") Presence.Start();
+            Overlay.Start(Environment.GetEnvironmentVariable("AXON_OVERLAY") != "off");
+            Configure(
+                EnvInt("AXON_IDLE_MS", 1200),
+                EnvInt("AXON_WAIT_MS", 6000),
+                Environment.GetEnvironmentVariable("AXON_MODE"));
 
             _js = new JavaScriptSerializer();
             _js.MaxJsonLength = 64 * 1024 * 1024;
@@ -259,6 +291,8 @@ namespace Axon
             ready["dpi_mode"] = _dpiMode;
             ready["pid"] = System.Diagnostics.Process.GetCurrentProcess().Id;
             ready["clr"] = Environment.Version.ToString();
+            ready["presence"] = Presence.HooksOk;
+            ready["overlay"] = Overlay.Enabled;
             WriteLine(ready);
 
             while (true)
@@ -322,6 +356,7 @@ namespace Axon
             switch (op)
             {
                 case "ping": return OpPing();
+                case "presence": return OpPresence(a);
                 case "list_apps": return OpListApps(a);
                 case "snapshot": return OpSnapshot(a);
                 case "click": return OpClick(a);
@@ -566,6 +601,17 @@ namespace Axon
 
         // ---- window discovery -------------------------------------------------
 
+        static bool IsSelfWindow(AutomationElement el)
+        {
+            try
+            {
+                if (el.Current.ProcessId == _selfPid) return true;
+                IntPtr h = new IntPtr(el.Current.NativeWindowHandle);
+                return h != IntPtr.Zero && h == Overlay.Handle;
+            }
+            catch { return false; }
+        }
+
         static bool IsRealWindow(AutomationElement el)
         {
             try
@@ -576,6 +622,7 @@ namespace Axon
                 if (!Native.IsWindow(h)) return false;
                 if (!Native.IsWindowVisible(h)) return false;
                 if (Native.IsCloaked(h)) return false;
+                if (h == Overlay.Handle) return false;
                 foreach (string s in ShellClasses) if (s == c.ClassName) return false;
                 int[] r = RectOf(el);
                 if (r == null) return false;
@@ -597,6 +644,10 @@ namespace Axon
 
             foreach (AutomationElement w in wins)
             {
+                // Axon's own windows are never user windows, so they are excluded
+                // unconditionally - include_hidden reveals the user's minimized
+                // windows, not Axon's marker.
+                if (IsSelfWindow(w)) continue;
                 if (!includeHidden && !IsRealWindow(w)) continue;
                 try
                 {
@@ -607,14 +658,8 @@ namespace Axon
                     e["title"] = c.Name;
                     e["class"] = c.ClassName;
                     e["pid"] = c.ProcessId;
-                    string pname = null, ppath = null;
-                    try
-                    {
-                        System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(c.ProcessId);
-                        pname = p.ProcessName;
-                        try { ppath = p.MainModule.FileName; } catch { }
-                    }
-                    catch { }
+                    string pname, ppath;
+                    ProcessInfo(c.ProcessId, out pname, out ppath);
                     e["process"] = pname;
                     e["path"] = ppath;
                     e["rect"] = RectOf(w);
@@ -629,6 +674,28 @@ namespace Axon
             res["windows"] = list;
             res["dpi_mode"] = _dpiMode;
             return res;
+        }
+
+        // Process.MainModule is a slow call - tens of milliseconds each - and
+        // list_apps used to make one per window every time it ran. Names and
+        // paths do not change for the life of a pid, so they are looked up once.
+        static Dictionary<int, string[]> _procCache = new Dictionary<int, string[]>();
+
+        static void ProcessInfo(int pid, out string name, out string path)
+        {
+            string[] hit;
+            if (_procCache.TryGetValue(pid, out hit)) { name = hit[0]; path = hit[1]; return; }
+            name = null; path = null;
+            try
+            {
+                System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(pid);
+                name = p.ProcessName;
+                try { path = p.MainModule.FileName; } catch { }
+            }
+            catch { }
+            // Bounded, because pids are recycled and a long session sees many.
+            if (_procCache.Count > 256) _procCache.Clear();
+            _procCache[pid] = new string[] { name, path };
         }
 
         static AutomationElement ResolveWindow(Dictionary<string, object> a)
@@ -951,7 +1018,113 @@ namespace Axon
             return new int[] { r[0] + r[2] / 2, r[1] + r[3] / 2 };
         }
 
+        // ---- coexistence -------------------------------------------------------
+        //
+        // Axon shares one desktop with a human. Reading a window never touches
+        // input, and neither does invoking an accessibility pattern, so most of
+        // what Axon does is genuinely invisible. Only two things intrude: moving
+        // the cursor and taking the foreground. Those are what this gates.
+
+        static int _idleMs = 1200;      // quiet for this long counts as "not using it"
+        static int _waitMs = 6000;      // how long to wait for a gap before giving up
+        static string _mode = "share";  // share | yield | take
+
+        internal static void Configure(int idleMs, int waitMs, string mode)
+        {
+            if (idleMs > 0) _idleMs = idleMs;
+            if (waitMs >= 0) _waitMs = waitMs;
+            if (!string.IsNullOrEmpty(mode)) _mode = mode;
+        }
+
+        static string ModeOf(Dictionary<string, object> a)
+        {
+            string m = Str(Get(a, "mode"));
+            if (string.IsNullOrEmpty(m)) return _mode;
+            return m;
+        }
+
+        // Cheap gate on every action: never contend for the window the human is
+        // actively typing or clicking in. Cursor movement over a window is not
+        // enough to claim it - only deliberate input is.
+        static void GuardSameWindow(Dictionary<string, object> a, IntPtr target)
+        {
+            if (ModeOf(a) == "take") return;
+            if (!Presence.HooksOk || target == IntPtr.Zero) return;
+            if (!Presence.Busy(_idleMs)) return;
+            // Only their own window counts. Being busy elsewhere is exactly the
+            // case Axon is built for, and a window Axon itself just raised is
+            // not one the user was working in.
+            if (Hwnd(Presence.CommitWindow) != Hwnd(target)) return;
+            if (Native.GetForegroundWindow() != target) return;
+            throw new AxonError("user_in_window",
+                "The user is working in that window right now.",
+                "Work somewhere else, wait for them to stop, or pass mode:\"take\" if they asked you to drive this window while they watch.");
+        }
+
+        // Gate immediately before anything that moves the cursor or steals the
+        // foreground. Returns the number of ms spent waiting, or -1 if none.
+        static int GuardDisturb(Dictionary<string, object> a)
+        {
+            string mode = ModeOf(a);
+            if (mode == "take") return -1;
+            if (!Presence.Available) return -1;
+            if (!Presence.Active(_idleMs)) return -1;
+
+            if (mode == "yield")
+                throw new AxonError("user_busy",
+                    "The user is using the mouse or keyboard, and this step needs the cursor or the foreground.",
+                    "Reading and pattern-based actions still work while they are busy. Retry when they pause.");
+
+            int start = Environment.TickCount;
+            if (!Presence.WaitForQuiet(_idleMs, _waitMs))
+                throw new AxonError("user_busy",
+                    "Waited " + _waitMs + "ms but the user is still active, and this step needs the cursor or the foreground.",
+                    "Reading and pattern-based actions still work while they are busy. Retry when they pause, or pass mode:\"take\" to interrupt them.");
+            int waited = Environment.TickCount - start;
+            return waited > 0 ? waited : -1;
+        }
+
+        static void NoteWait(Dictionary<string, object> res, int waited)
+        {
+            if (waited > 0) res["waited_for_user_ms"] = waited;
+        }
+
+        static object OpPresence(Dictionary<string, object> a)
+        {
+            Dictionary<string, object> r = Presence.Report();
+            r["user_active"] = Presence.Active(_idleMs);
+            r["user_busy"] = Presence.Busy(_idleMs);
+            r["idle_threshold_ms"] = _idleMs;
+            r["mode"] = _mode;
+            IntPtr fg = Native.GetForegroundWindow();
+            r["foreground_hwnd"] = Hwnd(fg);
+            try
+            {
+                if (fg != IntPtr.Zero)
+                {
+                    AutomationElement fe = AutomationElement.FromHandle(fg);
+                    if (fe != null)
+                    {
+                        r["foreground_title"] = fe.Current.Name;
+                        uint pid;
+                        Native.GetWindowThreadProcessId(fg, out pid);
+                        try { r["foreground_process"] = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return r;
+        }
+
         // ---- actions ----------------------------------------------------------
+
+        // Window handles reach Axon from two directions: as an int from
+        // UIAutomation's NativeWindowHandle, and as an IntPtr from user32. On a
+        // handle with the high bit set those sign-extend differently, so every
+        // comparison goes through the same 32-bit normalisation.
+        internal static long Hwnd(IntPtr h) { return (long)(int)h; }
+        internal static long Hwnd(long h) { return (long)(int)h; }
 
         static IntPtr HwndArg(Dictionary<string, object> a)
         {
@@ -962,10 +1135,13 @@ namespace Axon
         // Keystrokes go wherever focus is, not to a window we name, so sending
         // them while another app is in front types into that app instead. Raise
         // the intended window first and refuse if it will not come forward.
-        static void RequireForeground(IntPtr expect)
+        static void RequireForeground(IntPtr expect) { RequireForeground(expect, null, null); }
+
+        static void RequireForeground(IntPtr expect, Dictionary<string, object> a, Dictionary<string, object> res)
         {
             if (expect == IntPtr.Zero) return;
             if (Native.GetForegroundWindow() == expect) return;
+            if (a != null) NoteWait(res, GuardDisturb(a));
             Native.ForceForeground(expect);
             System.Threading.Thread.Sleep(120);
             if (Native.GetForegroundWindow() != expect)
@@ -974,14 +1150,30 @@ namespace Axon
                     "Another app is holding the foreground, often a modal dialog. Resolve that first.");
         }
 
-        static void PhysicalClick(int[] point, string button, int clicks, IntPtr expectWindow)
+        static int EnvInt(string name, int fallback)
         {
+            string v = Environment.GetEnvironmentVariable(name);
+            int n;
+            if (!string.IsNullOrEmpty(v) && int.TryParse(v, out n) && n >= 0) return n;
+            return fallback;
+        }
+
+        static void PhysicalClick(Dictionary<string, object> a, int[] point, string button, int clicks, IntPtr expectWindow, Dictionary<string, object> res)
+        {
+            // This is one of only two things Axon does that the user can feel.
+            NoteWait(res, GuardDisturb(a));
+
+            // Borrow the pointer, then put it back where they left it.
+            Native.POINT saved;
+            bool haveSaved = Native.GetCursorPos(out saved);
+
             // A real click lands on whatever is topmost at that point. If
             // something covers the target, the click would silently go to the
             // wrong application, so confirm ownership rather than clicking blind.
             if (expectWindow != IntPtr.Zero)
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
+                if (owner == Overlay.Handle) owner = expectWindow;   // our own marker never counts as a cover
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
                     Native.ForceForeground(expectWindow);
@@ -1002,10 +1194,96 @@ namespace Axon
                 Native.MouseButton(button, false);
                 if (n < clicks - 1) System.Threading.Thread.Sleep(60);
             }
+            if (haveSaved && ModeOf(a) != "take")
+            {
+                System.Threading.Thread.Sleep(20);
+                Native.SetCursorPos(saved.X, saved.Y);
+                res["cursor_restored"] = true;
+            }
+        }
+
+        // UIA pattern calls block until the target app's message pump reports
+        // idle, and an app that never quite does pins the host for seconds. The
+        // action still has to complete, so cutting it short would mean reporting
+        // a click that never happened. The deadline is therefore generous: it
+        // exists to stop a wedged provider hanging the session forever, not to
+        // rush a slow one. Anything that hits it is reported as slow_provider
+        // so the caller knows the outcome is unconfirmed.
+        const int PatternDeadlineMs = 15000;
+
+        static bool RunPattern(Action act)
+        {
+            Exception failure = null;
+            using (System.Threading.ManualResetEventSlim done = new System.Threading.ManualResetEventSlim(false))
+            {
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { act(); }
+                    catch (Exception ex) { failure = ex; }
+                    finally { try { done.Set(); } catch { } }
+                });
+                bool finished = done.Wait(PatternDeadlineMs);
+                if (finished && failure != null) throw failure;
+                return finished;
+            }
+        }
+
+        // What the element looks like now that the action has landed. This is
+        // the difference between "clicked" and "clicked, and the label now reads
+        // pressed:3" - it saves Claude a whole follow-up snapshot per action,
+        // which is the single most common wasted round-trip.
+        static void AddNowState(Dictionary<string, object> res, AutomationElement el)
+        {
+            try
+            {
+                List<string> patterns = PatternsOf(el);
+
+                // Only elements that carry state have a meaningful "after". A
+                // plain button does not, and asking one for its value or text
+                // costs two UIA timeouts - four seconds - for nothing.
+                bool stateful = Has(patterns, "Value") || Has(patterns, "Toggle")
+                             || Has(patterns, "SelectionItem") || Has(patterns, "ExpandCollapse")
+                             || Has(patterns, "RangeValue");
+                if (!stateful) return;
+
+                Dictionary<string, object> now = new Dictionary<string, object>();
+                // Value only. TextPattern is the slow one and adds nothing here.
+                string v = null;
+                if (Has(patterns, "Value"))
+                {
+                    try
+                    {
+                        ValuePattern vp = el.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                        if (vp != null) v = vp.Current.Value;
+                    }
+                    catch { }
+                }
+                if (!string.IsNullOrEmpty(v)) now["text"] = v.Length > 200 ? v.Substring(0, 200) + "..." : v;
+                Dictionary<string, object> st = StateOf(el, patterns);
+                if (st != null)
+                {
+                    object o;
+                    if (st.TryGetValue("toggle", out o)) now["toggle"] = o;
+                    if (st.TryGetValue("selected", out o)) now["selected"] = o;
+                    if (st.TryGetValue("expand", out o)) now["expand"] = o;
+                    if (st.TryGetValue("value", out o)) now["value"] = o;
+                    if (st.TryGetValue("disabled", out o)) now["disabled"] = o;
+                }
+                if (now.Count > 0) res["now"] = now;
+            }
+            catch { /* the element may have gone; the action still succeeded */ }
+        }
+
+        // Draw what just happened, where it happened.
+        static void Trace(AutomationElement el, string label)
+        {
+            if (!Overlay.Enabled || el == null) return;
+            try { Overlay.Flash(RectOf(el), label); } catch { }
         }
 
         static object OpClick(Dictionary<string, object> a)
         {
+            GuardSameWindow(a, HwndArg(a));
             Target t = ResolveTarget(a);
             string button = Str(Get(a, "button"));
             if (string.IsNullOrEmpty(button)) button = "left";
@@ -1016,7 +1294,7 @@ namespace Axon
 
             if (t.Mode == "point")
             {
-                PhysicalClick(t.Point, button, clicks, HwndArg(a));
+                PhysicalClick(a, t.Point, button, clicks, HwndArg(a), res);
                 res["method"] = "physical";
                 res["point"] = t.Point;
                 return res;
@@ -1034,14 +1312,24 @@ namespace Axon
                     if (Has(patterns, "Invoke"))
                     {
                         InvokePattern p = el.GetCurrentPattern(InvokePattern.Pattern) as InvokePattern;
-                        if (p != null) { p.Invoke(); res["method"] = "invoke_pattern"; return res; }
+                        if (p != null)
+                        {
+                            Trace(el, "click");
+                            InvokePattern ip = p;
+                            if (!RunPattern(delegate { ip.Invoke(); })) res["slow_provider"] = true;
+                            res["method"] = "invoke_pattern";
+                            AddNowState(res, el);
+                            return res;
+                        }
                     }
                     if (Has(patterns, "Toggle"))
                     {
                         TogglePattern p = el.GetCurrentPattern(TogglePattern.Pattern) as TogglePattern;
                         if (p != null)
                         {
-                            p.Toggle();
+                            Trace(el, "toggle");
+                            TogglePattern tp2 = p;
+                            if (!RunPattern(delegate { tp2.Toggle(); })) res["slow_provider"] = true;
                             res["method"] = "toggle_pattern";
                             res["toggle"] = p.Current.ToggleState.ToString();
                             return res;
@@ -1050,7 +1338,15 @@ namespace Axon
                     if (Has(patterns, "SelectionItem"))
                     {
                         SelectionItemPattern p = el.GetCurrentPattern(SelectionItemPattern.Pattern) as SelectionItemPattern;
-                        if (p != null) { p.Select(); res["method"] = "selection_pattern"; return res; }
+                        if (p != null)
+                        {
+                            Trace(el, "select");
+                            SelectionItemPattern sp2 = p;
+                            if (!RunPattern(delegate { sp2.Select(); })) res["slow_provider"] = true;
+                            res["method"] = "selection_pattern";
+                            AddNowState(res, el);
+                            return res;
+                        }
                     }
                     if (Has(patterns, "ExpandCollapse"))
                     {
@@ -1070,15 +1366,19 @@ namespace Axon
             }
 
             try { el.SetFocus(); } catch { }
+            Trace(el, "click");
             int[] point = ClickPointOf(el);
-            PhysicalClick(point, button, clicks, HwndArg(a));
+            PhysicalClick(a, point, button, clicks, HwndArg(a), res);
             res["method"] = "physical";
             res["point"] = point;
+            System.Threading.Thread.Sleep(60);
+            AddNowState(res, el);
             return res;
         }
 
         static object OpSetValue(Dictionary<string, object> a)
         {
+            GuardSameWindow(a, HwndArg(a));
             Target t = ResolveTarget(a);
             if (t.Mode == "point")
                 throw new AxonError("bad_target", "set_value needs an element, not a point.", "Use index or selector.");
@@ -1100,15 +1400,20 @@ namespace Axon
                         throw new AxonError("readonly", "That field is read-only.", null);
                     try
                     {
+                        Trace(el, "type");
                         vp.SetValue(text);
                         res["method"] = "value_pattern";
                         res["value"] = vp.Current.Value;
+                        AddNowState(res, el);
                         return res;
                     }
                     catch { /* fall through to typing */ }
                 }
             }
 
+            // The value pattern was unavailable, so this falls back to real
+            // keystrokes - which the user can feel.
+            NoteWait(res, GuardDisturb(a));
             try { el.SetFocus(); }
             catch
             {
@@ -1127,6 +1432,8 @@ namespace Axon
         {
             string text = Str(Get(a, "text"));
             if (text == null) text = "";
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            GuardSameWindow(a, HwndArg(a));
             if (Get(a, "index") != null || Get(a, "selector") != null)
             {
                 Target t = ResolveTarget(a);
@@ -1136,10 +1443,9 @@ namespace Axon
             else
             {
                 // No element named, so this types into whatever holds focus.
-                RequireForeground(HwndArg(a));
+                RequireForeground(HwndArg(a), a, res);
             }
             Native.TypeUnicode(text);
-            Dictionary<string, object> res = new Dictionary<string, object>();
             res["typed"] = text.Length;
             return res;
         }
@@ -1187,14 +1493,15 @@ namespace Axon
             for (int i = 0; i < parts.Count - 1; i++) mods.Add(VkOf(parts[i]));
             ushort main = VkOf(parts[parts.Count - 1]);
 
-            RequireForeground(HwndArg(a));
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            GuardSameWindow(a, HwndArg(a));
+            RequireForeground(HwndArg(a), a, res);
 
             foreach (ushort m in mods) { Native.KeyDown(m); System.Threading.Thread.Sleep(8); }
             Native.KeyTap(main);
             System.Threading.Thread.Sleep(8);
             for (int i = mods.Count - 1; i >= 0; i--) Native.KeyUp(mods[i]);
 
-            Dictionary<string, object> res = new Dictionary<string, object>();
             res["sent"] = chord;
             return res;
         }
@@ -1204,6 +1511,7 @@ namespace Axon
             int amount = Int(Get(a, "amount"), -3);
             bool horizontal = Bool(Get(a, "horizontal"), false);
             Dictionary<string, object> res = new Dictionary<string, object>();
+            GuardSameWindow(a, HwndArg(a));
 
             if (Get(a, "index") != null || Get(a, "selector") != null)
             {
@@ -1243,6 +1551,7 @@ namespace Axon
                 if (arr != null && arr.Length >= 2) Native.SetCursorPos(Int(arr[0], 0), Int(arr[1], 0));
             }
 
+            NoteWait(res, GuardDisturb(a));
             System.Threading.Thread.Sleep(16);
             Native.MouseWheel(amount * 120, horizontal);
             res["method"] = "wheel";
@@ -1262,10 +1571,11 @@ namespace Axon
             }
             catch { throw new AxonError("window_gone", "The window disappeared while resolving it.", null); }
 
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            NoteWait(res, GuardDisturb(a));
             bool ok = Native.ForceForeground(h);
             System.Threading.Thread.Sleep(120);
 
-            Dictionary<string, object> res = new Dictionary<string, object>();
             res["focused"] = ok;
             res["hwnd"] = (long)h;
             res["title"] = title;

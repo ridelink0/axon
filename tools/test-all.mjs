@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const suites = ['policy-test.mjs', 'build-test.mjs', 'host-test.mjs', 'mcp-test.mjs'];
+const suites = ['policy-test.mjs', 'build-test.mjs', 'presence-test.mjs', 'host-test.mjs', 'mcp-test.mjs'];
 
 let failed = 0;
 const totals = [];
