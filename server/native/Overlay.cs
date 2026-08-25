@@ -39,12 +39,51 @@ namespace Axon
 
         static Thread _thread;
         static TraceForm _form;
+        static ChromeForm _chrome;
+        static System.Windows.Forms.Timer _idleTimer;
+        static volatile bool _stopRequested;
+
+        // Claude's own colour, so the ring reads as Claude working rather
+        // than as some anonymous program having taken the screen.
+        static readonly Color ClaudeColour = Color.FromArgb(217, 119, 87);
+
+        internal static bool StopRequested { get { return _stopRequested; } }
+
+        // Read once and cleared, so one press stops one run.
+        internal static bool ConsumeStop()
+        {
+            if (!_stopRequested) return false;
+            _stopRequested = false;
+            return true;
+        }
+
+        // Called by every acting op. Raises the ring and banner, and keeps
+        // them up until Axon has been quiet for a couple of seconds.
+        internal static void MarkActive()
+        {
+            if (!Enabled || _chrome == null) return;
+            try
+            {
+                _chrome.BeginInvoke((MethodInvoker)delegate
+                {
+                    try
+                    {
+                        _chrome.ShowChrome();
+                        if (_idleTimer != null) { _idleTimer.Stop(); _idleTimer.Start(); }
+                    }
+                    catch { }
+                });
+            }
+            catch { }
+        }
         static volatile bool _enabled = true;
         static volatile bool _ready;
 
         internal static bool Enabled { get { return _enabled && _ready; } }
         static IntPtr _hwnd;
+        static IntPtr _chromeHwnd;
         internal static IntPtr Handle { get { return _hwnd; } }
+        internal static IntPtr ChromeHandle { get { return _chromeHwnd; } }
 
         internal static void Start(bool enabled)
         {
@@ -76,6 +115,16 @@ namespace Axon
                 IntPtr h = _form.Handle;   // forces creation on this thread
                 _hwnd = h;                 // captured here, read from anywhere
                 try { SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE); } catch { }
+
+                _chrome = new ChromeForm(ClaudeColour);
+                _chrome.CreateControl();
+                _chromeHwnd = _chrome.Handle;
+                try { SetWindowDisplayAffinity(_chromeHwnd, WDA_EXCLUDEFROMCAPTURE); } catch { }
+
+                _idleTimer = new System.Windows.Forms.Timer();
+                _idleTimer.Interval = 2200;
+                _idleTimer.Tick += delegate { _idleTimer.Stop(); try { _chrome.HideChrome(); } catch { } };
+
                 _ready = true;
                 Application.Run(_form);
             }
@@ -123,6 +172,121 @@ namespace Axon
         {
             try { if (_form != null) _form.BeginInvoke((MethodInvoker)delegate { Application.ExitThread(); }); }
             catch { }
+        }
+
+        // The ring is one layered window spanning the virtual screen, hollow in
+        // the middle, so it frames every display without covering any of it.
+        // Codex has no equivalent on Windows - its own issue #19305 is a request
+        // for "visible indication when Codex is observing or controlling the
+        // desktop". Claude Code's macOS build does have it, as a notification
+        // reading "Claude is using your computer". This brings that to Windows.
+        sealed class ChromeForm : Form
+        {
+            readonly Color _c;
+            readonly Button _stop;
+
+            internal ChromeForm(Color c)
+            {
+                _c = c;
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                TopMost = true;
+                StartPosition = FormStartPosition.Manual;
+                BackColor = Color.Magenta;
+                TransparencyKey = Color.Magenta;
+                Bounds = SystemInformation.VirtualScreen;
+
+                // This window is the size of every monitor put together, so an
+                // unbuffered repaint of it flickers badly. Paint off-screen and
+                // blit once.
+                SetStyle(ControlStyles.OptimizedDoubleBuffer
+                       | ControlStyles.AllPaintingInWmPaint
+                       | ControlStyles.UserPaint, true);
+                DoubleBuffered = true;
+
+                _stop = new Button();
+                _stop.Text = "Stop";
+                _stop.FlatStyle = FlatStyle.Flat;
+                _stop.BackColor = Color.White;
+                _stop.ForeColor = Color.FromArgb(30, 30, 30);
+                _stop.FlatAppearance.BorderSize = 0;
+                _stop.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+                _stop.Size = new Size(104, 36);
+                _stop.Cursor = Cursors.Hand;
+                _stop.Click += delegate { _stopRequested = true; HideChrome(); };
+                Controls.Add(_stop);
+            }
+
+            protected override bool ShowWithoutActivation { get { return true; } }
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    // No WS_EX_TRANSPARENT: Stop has to be clickable. NOACTIVATE
+                    // still means pressing it never moves the user's focus.
+                    cp.ExStyle |= 0x00000080 | 0x08000000 | 0x00080000;
+                    return cp;
+                }
+            }
+
+            static Size BannerSize() { return new Size(380, 54); }
+
+            // Called on every action, so it must do nothing at all once the
+            // chrome is already up. Re-setting bounds, re-asserting TopMost or
+            // invalidating on each call is what made it strobe.
+            internal void ShowChrome()
+            {
+                if (Visible) return;
+                Bounds = SystemInformation.VirtualScreen;
+                Size sz = BannerSize();
+                int x = (Width - sz.Width) / 2;
+                _stop.Location = new Point(x + sz.Width - _stop.Width - 12, 10 + (sz.Height - _stop.Height) / 2);
+                Show();
+                TopMost = true;
+            }
+
+            internal void HideChrome() { if (Visible) Hide(); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+
+                using (Pen pen = new Pen(_c, 4f))
+                {
+                    pen.Alignment = PenAlignment.Inset;
+                    g.DrawRectangle(pen, new Rectangle(0, 0, Width - 1, Height - 1));
+                }
+
+                Size sz = BannerSize();
+                Rectangle banner = new Rectangle((Width - sz.Width) / 2, 8, sz.Width, sz.Height);
+                using (SolidBrush bg = new SolidBrush(_c))
+                using (GraphicsPath path = RoundRect(banner, 8f))
+                    g.FillPath(bg, path);
+
+                using (Font f = new Font("Segoe UI", 10.5f, FontStyle.Regular))
+                using (SolidBrush fg = new SolidBrush(Color.White))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.LineAlignment = StringAlignment.Center;
+                    g.DrawString("Claude is using your computer", f, fg,
+                        new RectangleF(banner.X + 16, banner.Y, banner.Width - _stop.Width - 28, banner.Height), sf);
+                }
+            }
+
+            static GraphicsPath RoundRect(Rectangle r, float radius)
+            {
+                GraphicsPath p = new GraphicsPath();
+                float d = radius * 2;
+                p.AddArc(r.X, r.Y, d, d, 180, 90);
+                p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+                p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+                p.CloseFigure();
+                return p;
+            }
         }
 
         sealed class TraceForm : Form

@@ -531,6 +531,14 @@ async function handleMessage(msg) {
       reply(id, result);
     } catch (err) {
       if (err instanceof HostError) {
+        // Stop means stop. Withdrawing every grant makes that structural rather
+        // than advisory: nothing can act again until the user says so.
+        if (err.code === 'stopped_by_user') {
+          const n = policy.revokeAll();
+          reply(id, fail(err.code, err.message,
+            `${err.hint} All input permissions (${n}) withdrawn; acting again needs a fresh axon_grant.`));
+          return;
+        }
         reply(id, fail(err.code, err.message, err.hint));
       } else {
         reply(id, fail('internal', err && err.message ? err.message : String(err), null));

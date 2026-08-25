@@ -607,7 +607,7 @@ namespace Axon
             {
                 if (el.Current.ProcessId == _selfPid) return true;
                 IntPtr h = new IntPtr(el.Current.NativeWindowHandle);
-                return h != IntPtr.Zero && h == Overlay.Handle;
+                return h != IntPtr.Zero && (h == Overlay.Handle || h == Overlay.ChromeHandle);
             }
             catch { return false; }
         }
@@ -622,7 +622,7 @@ namespace Axon
                 if (!Native.IsWindow(h)) return false;
                 if (!Native.IsWindowVisible(h)) return false;
                 if (Native.IsCloaked(h)) return false;
-                if (h == Overlay.Handle) return false;
+                if (h == Overlay.Handle || h == Overlay.ChromeHandle) return false;
                 foreach (string s in ShellClasses) if (s == c.ClassName) return false;
                 int[] r = RectOf(el);
                 if (r == null) return false;
@@ -1046,8 +1046,20 @@ namespace Axon
         // Cheap gate on every action: never contend for the window the human is
         // actively typing or clicking in. Cursor movement over a window is not
         // enough to claim it - only deliberate input is.
+        // A press of Stop on the banner halts the run. It is consumed here so
+        // one press stops one run, and the caller is told plainly.
+        static void GuardStopped()
+        {
+            if (Overlay.ConsumeStop())
+                throw new AxonError("stopped_by_user",
+                    "The user pressed Stop on the on-screen banner.",
+                    "They have taken the machine back. Do not retry: say what you had done so far and ask before continuing.");
+        }
+
         static void GuardSameWindow(Dictionary<string, object> a, IntPtr target)
         {
+            GuardStopped();
+            Overlay.MarkActive();
             if (ModeOf(a) == "take") return;
             if (!Presence.HooksOk || target == IntPtr.Zero) return;
             if (!Presence.Busy(_idleMs)) return;
@@ -1065,6 +1077,8 @@ namespace Axon
         // foreground. Returns the number of ms spent waiting, or -1 if none.
         static int GuardDisturb(Dictionary<string, object> a)
         {
+            GuardStopped();
+            Overlay.MarkActive();
             string mode = ModeOf(a);
             if (mode == "take") return -1;
             if (!Presence.Available) return -1;
@@ -1095,6 +1109,7 @@ namespace Axon
             r["user_active"] = Presence.Active(_idleMs);
             r["user_busy"] = Presence.Busy(_idleMs);
             r["idle_threshold_ms"] = _idleMs;
+            r["stop_requested"] = Overlay.StopRequested;
             r["mode"] = _mode;
             IntPtr fg = Native.GetForegroundWindow();
             r["foreground_hwnd"] = Hwnd(fg);
@@ -1173,7 +1188,8 @@ namespace Axon
             if (expectWindow != IntPtr.Zero)
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
-                if (owner == Overlay.Handle) owner = expectWindow;   // our own marker never counts as a cover
+                // Axon's own marker and banner never count as a window covering the target.
+                if (owner == Overlay.Handle || owner == Overlay.ChromeHandle) owner = expectWindow;
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
                     Native.ForceForeground(expectWindow);
