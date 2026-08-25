@@ -160,8 +160,9 @@ Being straight about the gaps:
 ## Development
 
 ```
-node tools/test-all.mjs        all 158 tests
+node tools/test-all.mjs        all 171 tests
 node tools/policy-test.mjs      57  safety model: tiers, grants, refusals
+node tools/build-test.mjs       13  local compile: cold build, idempotence, concurrent builds
 node tools/host-test.mjs        52  compiled host: tree, patterns, input, crash recovery
 node tools/mcp-test.mjs         49  MCP protocol end to end; prints the token cost summary
 node server/build.mjs --force       rebuild the host
@@ -170,8 +171,8 @@ node server/build.mjs --force       rebuild the host
 The host and MCP suites create their own throwaway target window and never
 touch a pre-existing app. Beyond the happy paths they cover the things that
 actually bite: stale snapshot indices, a dead host mid-session, five concurrent
-calls, a window covered by another window, minimized windows, and every typed
-error code.
+calls, a window covered by another window, minimized windows, two sessions
+compiling the host at the same time, and every typed error code.
 
 There is also a behavioural eval (`claude plugin eval axon`) checking that
 Claude reaches for the tree rather than a screenshot.

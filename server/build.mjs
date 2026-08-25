@@ -28,11 +28,13 @@ export function binDir() {
   return path.join(dataDir(), 'bin');
 }
 
-export function exePath() {
-  return path.join(binDir(), 'AxonHost.exe');
+// The binary is named after a hash of its own source and reference set. Two
+// Claude Code sessions starting at once therefore agree on the filename without
+// coordinating, and a rebuild after an edit writes a new file rather than
+// overwriting one another session may be executing.
+function exeFor(stamp) {
+  return path.join(binDir(), `AxonHost-${stamp.slice(0, 16)}.exe`);
 }
-
-const stampPath = () => path.join(binDir(), 'AxonHost.stamp');
 
 function findCsc() {
   const win = process.env.WINDIR || process.env.SystemRoot || 'C:\\Windows';
@@ -116,27 +118,28 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
     );
   }
 
-  const exe = exePath();
   const stamp = computeStamp(csc, refs);
+  const exe = exeFor(stamp);
 
-  if (!force && fs.existsSync(exe) && fs.existsSync(stampPath())) {
-    try {
-      if (fs.readFileSync(stampPath(), 'utf8').trim() === stamp) {
-        log('host up to date');
-        return { exe, rebuilt: false, csc };
-      }
-    } catch { /* fall through and rebuild */ }
+  if (!force && fs.existsSync(exe)) {
+    log('host up to date');
+    return { exe, rebuilt: false, csc };
   }
 
   fs.mkdirSync(binDir(), { recursive: true });
   log('compiling host with ' + csc);
+
+  // Compile to a process-unique name first. Two sessions racing here each build
+  // their own file and then try to claim the shared name, so neither can ever
+  // write into a binary the other is executing.
+  const temp = path.join(binDir(), `.build-${process.pid}-${Date.now()}.exe`);
 
   const args = [
     '-nologo',
     '-optimize+',
     '-target:exe',
     '-platform:anycpu',
-    '-out:' + exe,
+    '-out:' + temp,
     ...refs.map((r) => '-r:' + r),
     '-r:System.Web.Extensions.dll',
     '-r:System.Drawing.dll',
@@ -152,13 +155,38 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
     const out = ((res.stdout || '') + (res.stderr || '')).trim();
     throw new BuildError('Compiling the Axon host failed.', out.slice(0, 2000));
   }
-  if (!fs.existsSync(exe)) {
+  if (!fs.existsSync(temp)) {
     throw new BuildError('The compiler reported success but produced no executable.', null);
   }
 
-  fs.writeFileSync(stampPath(), stamp, 'utf8');
+  try {
+    fs.renameSync(temp, exe);
+  } catch (err) {
+    // Losing the race is fine: the winner's binary has identical contents,
+    // because the name is a hash of exactly what went into it.
+    try { fs.unlinkSync(temp); } catch {}
+    if (!fs.existsSync(exe)) {
+      throw new BuildError('Could not place the compiled host: ' + err.message, null);
+    }
+  }
+
+  pruneOldBuilds(exe, log);
   log('host built at ' + exe);
   return { exe, rebuilt: true, csc };
+}
+
+// Superseded binaries from earlier versions of the source. A file still being
+// executed by another session cannot be deleted on Windows, and that refusal is
+// exactly the outcome we want, so failures here are ignored.
+function pruneOldBuilds(keep, log) {
+  let entries;
+  try { entries = fs.readdirSync(binDir()); } catch { return; }
+  for (const name of entries) {
+    if (!/^(AxonHost-.*\.exe|\.build-.*\.exe|AxonHost\.(exe|stamp))$/.test(name)) continue;
+    const full = path.join(binDir(), name);
+    if (full === keep) continue;
+    try { fs.unlinkSync(full); } catch { /* in use by another session */ }
+  }
 }
 
 // Allow `node build.mjs` for a manual/diagnostic build.
