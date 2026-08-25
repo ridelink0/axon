@@ -607,7 +607,7 @@ namespace Axon
             {
                 if (el.Current.ProcessId == _selfPid) return true;
                 IntPtr h = new IntPtr(el.Current.NativeWindowHandle);
-                return h != IntPtr.Zero && (h == Overlay.Handle || h == Overlay.ChromeHandle);
+                return Overlay.IsOwnWindow(h);
             }
             catch { return false; }
         }
@@ -622,7 +622,7 @@ namespace Axon
                 if (!Native.IsWindow(h)) return false;
                 if (!Native.IsWindowVisible(h)) return false;
                 if (Native.IsCloaked(h)) return false;
-                if (h == Overlay.Handle || h == Overlay.ChromeHandle) return false;
+                if (Overlay.IsOwnWindow(h)) return false;
                 foreach (string s in ShellClasses) if (s == c.ClassName) return false;
                 int[] r = RectOf(el);
                 if (r == null) return false;
@@ -1189,7 +1189,7 @@ namespace Axon
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
                 // Axon's own marker and banner never count as a window covering the target.
-                if (owner == Overlay.Handle || owner == Overlay.ChromeHandle) owner = expectWindow;
+                if (Overlay.IsOwnWindow(owner)) owner = expectWindow;
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
                     Native.ForceForeground(expectWindow);
