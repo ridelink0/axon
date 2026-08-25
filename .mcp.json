@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "axon": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"],
+      "env": {
+        "AXON_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "AXON_BLOCKED_APPS": "${user_config.blocked_apps}"
+      }
+    }
+  }
+}

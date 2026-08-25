@@ -1,0 +1,31 @@
+{
+  "name": "axon",
+  "displayName": "Axon",
+  "version": "0.1.0",
+  "description": "Semantic, tree-first computer use for Windows. Drives desktop apps through the UI Automation accessibility tree instead of screenshots, so targeting is precise, DPI-proof, and about 20x cheaper in tokens. Adds to Claude Code's built-in computer use; never replaces it.",
+  "author": {
+    "name": "ridelink0",
+    "url": "https://github.com/ridelink0"
+  },
+  "homepage": "https://github.com/ridelink0/axon",
+  "repository": "https://github.com/ridelink0/axon",
+  "license": "MIT",
+  "keywords": [
+    "computer-use",
+    "windows",
+    "ui-automation",
+    "accessibility",
+    "desktop-automation",
+    "gui",
+    "agent"
+  ],
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "blocked_apps": {
+      "type": "string",
+      "title": "Additional blocked apps",
+      "description": "Comma-separated process names Axon must never read or drive, on top of its built-in blocklist. Example: myvault,internal-admin",
+      "required": false
+    }
+  }
+}

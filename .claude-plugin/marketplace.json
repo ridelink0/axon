@@ -1,0 +1,34 @@
+{
+  "name": "axon",
+  "owner": {
+    "name": "ridelink0",
+    "url": "https://github.com/ridelink0"
+  },
+  "metadata": {
+    "description": "Semantic computer use for Windows",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "axon",
+      "source": "./",
+      "description": "Semantic, tree-first computer use for Windows. Drives desktop apps through the UI Automation accessibility tree instead of screenshots, so targeting is precise, DPI-proof, and about 20x cheaper in tokens. Adds to Claude Code's built-in computer use; never replaces it.",
+      "version": "0.1.0",
+      "author": {
+        "name": "ridelink0",
+        "url": "https://github.com/ridelink0"
+      },
+      "homepage": "https://github.com/ridelink0/axon",
+      "license": "MIT",
+      "keywords": [
+        "computer-use",
+        "windows",
+        "ui-automation",
+        "accessibility",
+        "desktop-automation",
+        "gui",
+        "agent"
+      ]
+    }
+  ]
+}
