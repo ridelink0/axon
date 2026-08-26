@@ -1270,22 +1270,32 @@ namespace Axon
             bool haveSaved = Native.GetCursorPos(out saved);
 
             // A real click lands on whatever is topmost at that point. If
-            // something covers the target, the click would silently go to the
-            // wrong application, so confirm ownership rather than clicking blind.
+            // something covers the target, the click would go to the wrong app,
+            // so confirm ownership rather than clicking blind.
             if (expectWindow != IntPtr.Zero)
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
-                // Computer Use's own marker and banner never count as a window covering the target.
+                // Computer Use's own marker and banner never count as a cover.
                 if (Overlay.IsOwnWindow(owner)) owner = expectWindow;
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
-                    Native.ForceForeground(expectWindow);
-                    System.Threading.Thread.Sleep(120);
-                    owner = Native.RootWindowAt(point[0], point[1]);
+                    // Only take/exclusive may raise a covered window - those are
+                    // the modes where the user has said to drive. In share and
+                    // yield, raising it would yank the user away from whatever
+                    // they are doing in front, so instead refuse and let Claude
+                    // use the pattern path, which needs no foreground at all.
+                    string m = ModeOf(a);
+                    bool mayRaise = (m == "take" || m == "exclusive");
+                    if (mayRaise)
+                    {
+                        Native.ForceForeground(expectWindow);
+                        System.Threading.Thread.Sleep(120);
+                        owner = Native.RootWindowAt(point[0], point[1]);
+                    }
                     if (owner != IntPtr.Zero && owner != expectWindow)
                         throw new AxonError("obscured",
-                            "Another window covers that point, so a real click would land on it.",
-                            "Move or close what is on top, or target an element that exposes an invoke pattern - those do not need the window to be visible.");
+                            "That control is behind another window, so a real click would hit the wrong one.",
+                            "Target it by index or selector instead - the pattern path clicks it where it sits, without raising it over what the user is doing.");
                 }
             }
             bool held = Exclusive(a) && Native.BeginExclusive();
@@ -1303,9 +1313,14 @@ namespace Axon
             }
             finally { if (held) Native.EndExclusive(); }
             if (held) res["input_held"] = true;
-            if (haveSaved && ModeOf(a) != "take")
+            // Always put the pointer back. The click is the action; leaving the
+            // cursor parked on the control just makes the user's own pointer
+            // appear to jump away. Even in take mode, snapping it back the moment
+            // the click lands is what the user expects - a brief flick, not a
+            // relocation. Only skip when input is being held (exclusive), where
+            // the user's pointer is frozen anyway and cannot be confused.
+            if (haveSaved && !held)
             {
-                System.Threading.Thread.Sleep(20);
                 Native.SetCursorPos(saved.X, saved.Y);
                 res["cursor_restored"] = true;
             }
@@ -1383,12 +1398,21 @@ namespace Axon
             catch { /* the element may have gone; the action still succeeded */ }
         }
 
-        // Draw what just happened, where it happened.
-        static void Trace(AutomationElement el, string label)
+        // Draw what just happened, where it happened - but only if the user can
+        // actually see the spot. When Computer Use acts on a window behind the
+        // one the user is working in, drawing a marker there would paint on top
+        // of the user's front window instead: "going over their thing". So the
+        // marker and cursor are suppressed when the target control is covered by
+        // another window, and the top banner alone signals that work is going on.
+        static void Trace(AutomationElement el, string label, IntPtr expectWindow)
         {
             if (!Overlay.Enabled || el == null) return;
             try
             {
+                int[] r = RectOf(el);
+                if (r == null) return;
+                if (IsOccluded(r, expectWindow)) return;
+
                 // Name the control, not just the verb. "click: Save" is
                 // readable from across the room; a bare rectangle is not.
                 string name = NameOf(el);
@@ -1397,9 +1421,33 @@ namespace Axon
                     if (name.Length > 34) name = name.Substring(0, 34) + "...";
                     label = label + ": " + name;
                 }
-                Overlay.Flash(RectOf(el), label);
+                Overlay.Flash(r, label);
             }
             catch { }
+        }
+
+        // True only when we are CONFIDENT the control is behind another window:
+        // the caller told us which window it belongs to (the MCP layer always
+        // does), and the pixel at the control's centre is owned by a different,
+        // real application window. If the target window is unknown, or the pixel
+        // belongs to the target or to Computer Use's own overlay, it is treated
+        // as visible - so the marker and cursor show in the normal foreground
+        // case, and are hidden only for genuine behind-another-window work.
+        static bool IsOccluded(int[] r, IntPtr expectWindow)
+        {
+            try
+            {
+                if (expectWindow == IntPtr.Zero) return false;
+                int cx = r[0] + r[2] / 2;
+                int cy = r[1] + r[3] / 2;
+                IntPtr onTop = Native.RootWindowAt(cx, cy);
+                if (onTop == IntPtr.Zero || Overlay.IsOwnWindow(onTop)) return false;
+
+                IntPtr expRoot = Native.GetAncestor(expectWindow, 2 /* GA_ROOT */);
+                if (expRoot == IntPtr.Zero) expRoot = expectWindow;
+                return onTop != expRoot;
+            }
+            catch { return false; }
         }
 
         static object OpClick(Dictionary<string, object> a)
@@ -1435,7 +1483,7 @@ namespace Axon
                         InvokePattern p = el.GetCurrentPattern(InvokePattern.Pattern) as InvokePattern;
                         if (p != null)
                         {
-                            Trace(el, "click");
+                            Trace(el, "click", HwndArg(a));
                             InvokePattern ip = p;
                             if (!RunPattern(delegate { ip.Invoke(); })) res["slow_provider"] = true;
                             res["method"] = "invoke_pattern";
@@ -1448,7 +1496,7 @@ namespace Axon
                         TogglePattern p = el.GetCurrentPattern(TogglePattern.Pattern) as TogglePattern;
                         if (p != null)
                         {
-                            Trace(el, "toggle");
+                            Trace(el, "toggle", HwndArg(a));
                             TogglePattern tp2 = p;
                             if (!RunPattern(delegate { tp2.Toggle(); })) res["slow_provider"] = true;
                             res["method"] = "toggle_pattern";
@@ -1461,7 +1509,7 @@ namespace Axon
                         SelectionItemPattern p = el.GetCurrentPattern(SelectionItemPattern.Pattern) as SelectionItemPattern;
                         if (p != null)
                         {
-                            Trace(el, "select");
+                            Trace(el, "select", HwndArg(a));
                             SelectionItemPattern sp2 = p;
                             if (!RunPattern(delegate { sp2.Select(); })) res["slow_provider"] = true;
                             res["method"] = "selection_pattern";
@@ -1487,7 +1535,7 @@ namespace Axon
             }
 
             try { el.SetFocus(); } catch { }
-            Trace(el, "click");
+            Trace(el, "click", HwndArg(a));
             int[] point = ClickPointOf(el);
             PhysicalClick(a, point, button, clicks, HwndArg(a), res);
             res["method"] = "physical";
@@ -1521,7 +1569,7 @@ namespace Axon
                         throw new AxonError("readonly", "That field is read-only.", null);
                     try
                     {
-                        Trace(el, "type");
+                        Trace(el, "type", HwndArg(a));
                         vp.SetValue(text);
                         res["method"] = "value_pattern";
                         res["value"] = vp.Current.Value;

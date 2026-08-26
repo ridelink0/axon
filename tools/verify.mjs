@@ -43,6 +43,16 @@ async function main() {
   const info = await d.start();
   const opened = [];
 
+  // Start clean: a prior run (or a crashed test) can leave target windows on
+  // screen, and one left covering the desktop would make a later physical click
+  // fail with `obscured`. Close any that are still around before beginning.
+  try {
+    const stray = (await d.call('list_apps', { include_hidden: true })).result.windows
+      .filter((x) => (x.title || '').includes('Computer Use Test Target'));
+    for (const s of stray) { try { await d.call('close_window', { hwnd: s.hwnd, mode: 'take' }); } catch {} }
+    if (stray.length) await new Promise((r) => setTimeout(r, 400));
+  } catch {}
+
   console.log('\n== host ==');
   check('host started', info.event === 'ready');
   check('DPI aware', info.dpi_mode && info.dpi_mode !== 'none', info.dpi_mode);
@@ -113,6 +123,30 @@ async function main() {
   const bgSnap = (await d.call('snapshot', { hwnd: w.hwnd })).result;
   check('the covered click landed', !!node(bgSnap, (n) => n.name && n.name.startsWith('pressed:')));
   check('acting on it did not raise it itself', true, `fg was ${fgBefore}`);
+
+  console.log('\n== two windows, work does not collide ==');
+  // The real-world case: you are working in a front window while Claude drives
+  // a separate one behind it. Acting on the back window must not change the
+  // front window at all - distinct windows have distinct element trees, and the
+  // pattern path targets one element in one window.
+  {
+    const live = (await d.call('list_apps')).result.windows;
+    const frontHwnd = live.find((x) => x.title === cover.title)?.hwnd;
+    const backHwnd = live.find((x) => x.title === app.title)?.hwnd;
+    check('both windows are still open', !!frontHwnd && !!backHwnd);
+    const frontSnap = (await d.call('snapshot', { hwnd: frontHwnd })).result;
+    const frontStatusBefore = node(frontSnap, (n) => n.name && (n.name.startsWith('idle') || n.name.startsWith('pressed:')))?.name;
+    const frontBtn = node(frontSnap, (n) => n.name === 'Press Me');
+    // Hammer the BACK window several times.
+    for (let i = 0; i < 3; i++) {
+      await d.call('click', { hwnd: backHwnd, selector: { name: 'Press Me' }, mode: 'take' });
+    }
+    const frontAfter = (await d.call('snapshot', { hwnd: frontHwnd })).result;
+    const frontStatusAfter = node(frontAfter, (n) => n.name && (n.name.startsWith('idle') || n.name.startsWith('pressed:')))?.name;
+    check('driving the back window left the front window untouched',
+          frontStatusBefore === frontStatusAfter, `front was ${frontStatusBefore}, now ${frontStatusAfter}`);
+    check('the front window still has its own controls', !!frontBtn);
+  }
 
   console.log('\n== the visible chrome ==');
   const st = (await d.call('presence')).result;

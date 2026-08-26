@@ -21,7 +21,7 @@ the tree is also *more* accurate: it gives you exact element identities rather
 than pixel guesses, and it includes text that is scrolled out of view, which a
 screenshot physically cannot contain.
 
-Reach for `computer_screenshot` only when the tree genuinely cannot help:
+Reach for pixels only when the tree genuinely cannot help:
 
 - canvas-drawn surfaces (image editors, Figma-like tools, games, charts)
 - verifying something visual: layout, colour, spacing, a rendering bug
@@ -29,6 +29,20 @@ Reach for `computer_screenshot` only when the tree genuinely cannot help:
 
 If you find yourself taking a screenshot to find a button, stop. Take a
 snapshot instead.
+
+### Seeing a window the way Codex does
+
+When you do need pixels, prefer `computer_snapshot { hwnd, with_image: true }`
+over a bare `computer_screenshot`. That is the hybrid observation Codex's
+computer use is built on: the semantic tree AND a picture of the same window, in
+one read. The tree gives you exact element identity and the text scrolled out of
+view; the image gives you the visual detail - a chart, a canvas, a layout bug -
+that no tree can describe. You get both aligned to the same window, so you can
+reason across structure and appearance at once.
+
+Use `with_image` for visual verification and canvas work. Use a plain snapshot,
+no image, for everything else - it is 15x cheaper and enough to find and drive
+controls.
 
 ## Workflow
 

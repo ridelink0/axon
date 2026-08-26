@@ -98,7 +98,7 @@ const TOOLS = [
       max_nodes: int, max_depth: int,
       text_limit: { type: 'integer', description: 'Chars of element text to show. Default 200.' },
       with_rects: { type: 'boolean', description: 'Include bounding boxes. Only needed for point targeting.' },
-      with_image: { type: 'boolean', description: 'Also attach an image. Costs ~15x the tree.' },
+      with_image: { type: 'boolean', description: 'Hybrid read: tree PLUS a picture of the same window, the way Codex sees. For visual/canvas checks. Costs ~15x the tree.' },
     } },
   },
   {
@@ -353,13 +353,18 @@ const handlers = {
 
     const content = [{ type: 'text', text: body }];
     if (args.with_image) {
-      // The tree is the point of this call. If the picture cannot be taken -
-      // the window is minimized, or closing - say so and still hand back the
-      // tree rather than losing the whole result.
+      // The hybrid read, which is how Codex actually sees a window: the semantic
+      // tree AND a picture of the same window, together. The tree is exact and
+      // carries text scrolled out of view; the image shows canvas-drawn and
+      // visual detail the tree cannot describe. If the picture cannot be taken -
+      // the window is minimized or closing - hand back the tree anyway.
       try {
-        const shot = await driver.call('screenshot', { hwnd: Number(win.hwnd), max_width: 1000, quality: 55 });
+        const shot = await driver.call('screenshot', { hwnd: Number(win.hwnd), max_width: 1100, quality: 60 });
         budget.shots++;
         budget.shotBytes += shot.result.bytes;
+        content[0].text +=
+          `\n\n[image of this same window attached below (${shot.result.width}x${shot.result.height}). ` +
+          `The tree above is exact and includes text scrolled out of view; the image shows visual detail the tree cannot.]`;
         content.push({ type: 'image', data: shot.result.data, mimeType: shot.result.mime });
       } catch (err) {
         content[0].text += `\n\n(no image: ${err.code || 'error'} - ${err.message})`;

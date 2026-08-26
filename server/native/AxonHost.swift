@@ -215,7 +215,9 @@ func modeOf(_ a: [String: Any]) -> String {
 }
 
 func guardSameWindow(_ a: [String: Any], _ targetPid: pid_t) throws {
-    if modeOf(a) == "take" { return }
+    // take and exclusive both mean "go now", matching the Windows host.
+    let m = modeOf(a)
+    if m == "take" || m == "exclusive" { return }
     if !Presence.shared.monitoring || targetPid == 0 { return }
     if !Presence.shared.busy(idleThresholdMs) { return }
     if Presence.shared.userPid != targetPid { return }
@@ -226,7 +228,7 @@ func guardSameWindow(_ a: [String: Any], _ targetPid: pid_t) throws {
 
 func guardDisturb(_ a: [String: Any]) throws -> Int {
     let mode = modeOf(a)
-    if mode == "take" { return -1 }
+    if mode == "take" || mode == "exclusive" { return -1 }
     if !Presence.shared.monitoring { return -1 }
     if !Presence.shared.active(idleThresholdMs) { return -1 }
     if mode == "yield" {
@@ -462,6 +464,19 @@ func markedEvent(_ e: CGEvent?) -> CGEvent? {
     return e
 }
 
+// What the element looks like now the action has landed, so the caller does not
+// need a second read just to confirm - the Windows host does the same.
+func nowState(_ el: AXUIElement) -> [String: Any]? {
+    var now: [String: Any] = [:]
+    if let v = axAttr(el, kAXValueAttribute as String) {
+        if let s = v as? String, !s.isEmpty { now["text"] = s.count > 200 ? String(s.prefix(200)) + "..." : s }
+        else if let b = v as? Bool { now["value"] = b }
+        else if let n = v as? Int { now["value"] = n }
+    }
+    if let enabled = axAttr(el, kAXEnabledAttribute as String) as? Bool, !enabled { now["disabled"] = true }
+    return now.isEmpty ? nil : now
+}
+
 func opClick(_ a: [String: Any]) throws -> [String: Any] {
     var res: [String: Any] = [:]
     let (el, pid) = try resolveTarget(a)
@@ -475,6 +490,8 @@ func opClick(_ a: [String: Any]) throws -> [String: Any] {
     if !forcePhysical && actions.contains("AXPress") {
         if AXUIElementPerformAction(el, "AXPress" as CFString) == .success {
             res["method"] = "ax_press"
+            Thread.sleep(forTimeInterval: 0.04)
+            if let now = nowState(el) { res["now"] = now }
             return res
         }
     }
@@ -493,13 +510,17 @@ func opClick(_ a: [String: Any]) throws -> [String: Any] {
     markedEvent(CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left))?.post(tap: .cghidEventTap)
     markedEvent(CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left))?.post(tap: .cghidEventTap)
 
-    if modeOf(a) != "take", let back = saved {
+    // take and exclusive both mean "drive it"; only the courtesy modes put the
+    // pointer back where the user left it.
+    let m = modeOf(a)
+    if m != "take" && m != "exclusive", let back = saved {
         Thread.sleep(forTimeInterval: 0.02)
         markedEvent(CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: back, mouseButton: .left))?.post(tap: .cghidEventTap)
         res["cursor_restored"] = true
     }
     res["method"] = "physical"
     res["point"] = [Int(point.x), Int(point.y)]
+    if let now = nowState(el) { res["now"] = now }
     return res
 }
 
@@ -508,7 +529,9 @@ func opSetValue(_ a: [String: Any]) throws -> [String: Any] {
     try guardSameWindow(a, pid)
     let text = str(a["text"]) ?? ""
     if AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
-        return ["method": "ax_value", "value": text]
+        var res: [String: Any] = ["method": "ax_value", "value": text]
+        if let now = nowState(el) { res["now"] = now }
+        return res
     }
     throw AxonError("readonly", "That element would not accept a value.",
                     "Focus it and use type instead.")
@@ -728,6 +751,11 @@ func opPresence(_ a: [String: Any]) throws -> [String: Any] {
     r["user_busy"] = Presence.shared.busy(idleThresholdMs)
     r["idle_threshold_ms"] = idleThresholdMs
     r["mode"] = defaultMode
+    // Protocol parity with the Windows host. macOS has no on-screen Stop banner
+    // and no BlockInput, so these are constant here, but the MCP layer reads
+    // them uniformly and must not see them missing.
+    r["stop_requested"] = false
+    r["input_blocked"] = false
     let front = NSWorkspace.shared.frontmostApplication
     r["foreground_hwnd"] = Int(front?.processIdentifier ?? 0)
     r["foreground_process"] = front?.localizedName as Any
