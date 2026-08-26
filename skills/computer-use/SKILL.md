@@ -21,6 +21,15 @@ the tree is also *more* accurate: it gives you exact element identities rather
 than pixel guesses, and it includes text that is scrolled out of view, which a
 screenshot physically cannot contain.
 
+**Web pages count too.** A browser or Electron app (Chrome, Edge, Opera, Brave,
+VS Code, Slack) reads through the tree like anything else - a plain snapshot
+sees the page's links, buttons, and form fields by name, and you fill a field
+with `computer_type { replace: true }` and click a button with `computer_click`,
+neither of which needs the window in front. Browsers keep their page hidden from
+accessibility until asked, and web content sits deep in the tree; the snapshot
+handles both for you automatically, so just snapshot the browser window and read
+the form. Do not reach for a screenshot to fill a web form.
+
 Reach for pixels only when the tree genuinely cannot help:
 
 - canvas-drawn surfaces (image editors, Figma-like tools, games, charts)
@@ -67,7 +76,8 @@ controls.
 ### Keeping snapshots cheap
 
 - `interactive_only: true` - drops everything you cannot act on.
-- `max_nodes` - default 400. A browser page will truncate; narrow it instead.
+- `max_nodes` - default 400 (1200 for browsers). If a huge page truncates,
+  narrow with `interactive_only` rather than raising this.
 - `text_limit` - default 200 chars per element. Raise it only when you actually
   need to read a document's contents; the default already shows head and tail
   with a character count.

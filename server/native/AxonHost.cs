@@ -35,6 +35,10 @@ namespace Axon
         [DllImport("user32.dll")] internal static extern bool GetCursorPos(out POINT p);
         [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr h, uint flags);
+        [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumChildProc cb, IntPtr lparam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetClassName(IntPtr h, System.Text.StringBuilder cls, int max);
+        [DllImport("user32.dll")] internal static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+        internal delegate bool EnumChildProc(IntPtr h, IntPtr lparam);
         [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr h, int cmd);
@@ -827,12 +831,97 @@ namespace Axon
         static readonly string[] InteractivePatterns = new string[]
         { "Invoke", "Toggle", "Value", "SelectionItem", "ExpandCollapse", "Scroll", "RangeValue" };
 
+        // Chromium browsers (Chrome, Edge, Opera, Brave, Vivaldi) do not expose
+        // their web page to the accessibility tree until an assistive-technology
+        // client asks for it - a memory optimisation. Without this, a snapshot of
+        // a browser sees only the toolbar and tabs, never the page. Sending the
+        // render widget a WM_GETOBJECT for the client accessible object is the
+        // signal Chromium waits for: it turns the web tree on. We then wait
+        // briefly for it to build. This makes reading a web page as seamless as
+        // reading any native window.
+        const uint WM_GETOBJECT = 0x003D;
+        static readonly IntPtr OBJID_CLIENT = new IntPtr(unchecked((int)0xFFFFFFFC));
+        const int UiaRootObjectId = -25;
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+
+        static bool IsChromiumWindow(AutomationElement win)
+        {
+            try
+            {
+                string cls = win.Current.ClassName ?? "";
+                if (cls.StartsWith("Chrome_WidgetWin")) return true;   // all Chromium browsers
+                string proc = "";
+                try { proc = System.Diagnostics.Process.GetProcessById(win.Current.ProcessId).ProcessName.ToLowerInvariant(); }
+                catch { }
+                foreach (string b in new string[] { "chrome", "msedge", "opera", "brave", "vivaldi", "chromium" })
+                    if (proc == b || proc.StartsWith(b)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        static void EnableWebAccessibility(IntPtr topHwnd)
+        {
+            if (topHwnd == IntPtr.Zero) return;
+            System.Collections.Generic.List<IntPtr> widgets = new System.Collections.Generic.List<IntPtr>();
+            try
+            {
+                Native.EnumChildWindows(topHwnd, delegate(IntPtr h, IntPtr lp)
+                {
+                    System.Text.StringBuilder sb = new System.Text.StringBuilder(128);
+                    Native.GetClassName(h, sb, sb.Capacity);
+                    string c = sb.ToString();
+                    // The window that hosts the page's accessibility tree.
+                    if (c == "Chrome_RenderWidgetHostHWND") widgets.Add(h);
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            // Poke the top window too, in case the render widget is not a direct
+            // child or has not been created yet.
+            widgets.Add(topHwnd);
+            foreach (IntPtr w in widgets)
+            {
+                try
+                {
+                    IntPtr res;
+                    Native.SendMessageTimeout(w, WM_GETOBJECT, IntPtr.Zero, OBJID_CLIENT, SMTO_ABORTIFHUNG, 300, out res);
+                    Native.SendMessageTimeout(w, WM_GETOBJECT, IntPtr.Zero, new IntPtr(UiaRootObjectId), SMTO_ABORTIFHUNG, 300, out res);
+                }
+                catch { }
+            }
+        }
+
         static object OpSnapshot(Dictionary<string, object> a)
         {
             AutomationElement win = RequireWindow(a);
-            int maxNodes = Int(Get(a, "max_nodes"), 400);
-            int maxDepth = Int(Get(a, "max_depth"), 14);
+            bool web = IsChromiumWindow(win);
+
+            // A web page's accessibility tree is much deeper and wider than a
+            // native window's - the form fields on a page sit 20-30 levels down.
+            // So a browser gets a deeper, roomier default; native windows keep
+            // the tight one. An explicit max_depth / max_nodes always wins.
+            bool hasDepth = Get(a, "max_depth") != null;
+            bool hasNodes = Get(a, "max_nodes") != null;
+            int maxNodes = hasNodes ? Int(Get(a, "max_nodes"), 400) : (web ? 1200 : 400);
+            int maxDepth = hasDepth ? Int(Get(a, "max_depth"), 14) : (web ? 45 : 14);
             bool interactiveOnly = Bool(Get(a, "interactive_only"), false);
+
+            if (web)
+            {
+                try
+                {
+                    IntPtr h = new IntPtr(win.Current.NativeWindowHandle);
+                    // Ask the browser to expose its page to accessibility (it
+                    // keeps it off until an assistive-tech client asks), then let
+                    // the tree build before reading.
+                    EnableWebAccessibility(h);
+                    System.Threading.Thread.Sleep(350);
+                    AutomationElement refreshed = ResolveWindow(a);
+                    if (refreshed != null) win = refreshed;
+                }
+                catch { }
+            }
 
             TreeWalker walker = TreeWalker.ControlViewWalker;
             List<AutomationElement> elements = new List<AutomationElement>();
@@ -931,6 +1020,7 @@ namespace Axon
             res["rect"] = RectOf(win);
             res["node_count"] = nodes.Count;
             res["truncated"] = truncated;
+            if (web) res["web_accessibility_enabled"] = true;
             res["nodes"] = nodes;
             return res;
         }
