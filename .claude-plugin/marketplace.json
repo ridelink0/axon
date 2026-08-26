@@ -11,6 +11,7 @@
   "plugins": [
     {
       "name": "computer-use",
+      "displayName": "Better Computer Use",
       "source": "./",
       "description": "Codex-style computer use for Claude Code. Drives Windows and macOS apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs about 20x fewer tokens. Knows your input from its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
       "version": "0.1.0",

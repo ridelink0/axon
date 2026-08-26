@@ -1,6 +1,8 @@
-# computer-use
+# Better Computer Use
 
-Semantic computer use for Claude Code, on Windows and macOS.
+Codex-style computer use for Claude Code, on Windows and macOS — the accessibility-tree way, not screenshots.
+
+> Install id: `computer-use`.
 
 ---
 
