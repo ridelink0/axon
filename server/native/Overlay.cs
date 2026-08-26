@@ -1,23 +1,21 @@
 // Overlay - everything Axon puts on screen.
 //
-// Three pieces, one colour:
-//   - a ring around the whole desktop while Axon is working, with a banner
-//     reading "Claude is using your computer" and a Stop button
-//   - a Claude-coloured cursor showing where Axon is, alongside your own
+// Four windows, one colour:
+//   - a ring around the whole desktop while Axon is working (click-through)
+//   - a banner reading "Claude is using your computer", with Stop
+//   - a Claude-coloured cursor showing where Axon is, alongside yours
 //   - a marker flashing around each control as it is touched
+//
+// The ring and the banner are separate windows on purpose. A painted ring on a
+// clickable window would put a live 4px band around every screen edge, eating
+// clicks meant for the taskbar, corner hot zones and window resize handles. The
+// ring is therefore click-through, and the banner - the one thing that must
+// accept a click - is a small window of its own.
 //
 // Axon never calls SetCursor, ShowCursor, or SetSystemCursor. Your pointer is
 // never touched, so it cannot be left in a bad state - which is the standing
 // Codex bug on Windows (openai/codex#25200), where users are asking for exactly
 // this: an overlay cursor instead of hijacking the system one.
-//
-// Everything here is:
-//   - click-through      WS_EX_TRANSPARENT, so it can never take a click
-//                        (the Stop button is the one deliberate exception)
-//   - never activating   WS_EX_NOACTIVATE, so it cannot steal focus
-//   - out of alt-tab     WS_EX_TOOLWINDOW
-//   - invisible to capture  WDA_EXCLUDEFROMCAPTURE, so Axon's screenshots never
-//                        contain Axon's own UI
 
 using System;
 using System.Drawing;
@@ -37,34 +35,35 @@ namespace Axon
 
         const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
 
-        // Anthropic's primary accent, from their own brand palette. One colour,
-        // everywhere - the ring, the banner, the cursor and the marker all draw
-        // from this, so Axon reads as one thing rather than a palette.
+        // Anthropic's own palette. One accent, everywhere - the ring, the banner,
+        // the cursor and the marker all draw from it, so Axon reads as one thing
+        // rather than as a colour scheme.
         internal static readonly Color Claude = Color.FromArgb(217, 119, 87);   // #D97757
         internal static readonly Color Ink = Color.FromArgb(20, 20, 19);        // #141413
         internal static readonly Color Paper = Color.FromArgb(250, 249, 245);   // #FAF9F5
 
         static Thread _thread;
         static TraceForm _marker;
-        static ChromeForm _chrome;
+        static RingForm _ring;
+        static BannerForm _banner;
         static CursorForm _cursor;
         static System.Windows.Forms.Timer _idleTimer;
         static volatile bool _stopRequested;
         static volatile bool _enabled = true;
         static volatile bool _ready;
-        static IntPtr _markerHwnd, _chromeHwnd, _cursorHwnd;
+        static IntPtr _markerHwnd, _ringHwnd, _bannerHwnd, _cursorHwnd;
         static string _fontName;
 
         internal static bool Enabled { get { return _enabled && _ready; } }
         internal static bool StopRequested { get { return _stopRequested; } }
 
-        // Any window Axon itself put on screen. Used to keep them out of its own
-        // listings, and to stop its own marker counting as something covering a
+        // Any window Axon itself put on screen. Keeps them out of its own
+        // listings, and stops its own marker counting as something covering a
         // click target.
         internal static bool IsOwnWindow(IntPtr h)
         {
             if (h == IntPtr.Zero) return false;
-            return h == _markerHwnd || h == _chromeHwnd || h == _cursorHwnd;
+            return h == _markerHwnd || h == _ringHwnd || h == _bannerHwnd || h == _cursorHwnd;
         }
 
         // Read once and cleared, so one press stops one run.
@@ -75,9 +74,11 @@ namespace Axon
             return true;
         }
 
+        internal static void RequestStop() { _stopRequested = true; }
+
         // OpenAI Sans and Söhne are licensed faces that cannot ship inside a
-        // plugin, so this picks the closest grotesque actually present on the
-        // machine rather than pretending to be them.
+        // plugin, so this resolves the closest grotesque actually installed
+        // rather than pretending to be either.
         internal static string UiFont
         {
             get
@@ -134,10 +135,15 @@ namespace Axon
                 _markerHwnd = _marker.Handle;
                 Exclude(_markerHwnd);
 
-                _chrome = new ChromeForm();
-                _chrome.CreateControl();
-                _chromeHwnd = _chrome.Handle;
-                Exclude(_chromeHwnd);
+                _ring = new RingForm();
+                _ring.CreateControl();
+                _ringHwnd = _ring.Handle;
+                Exclude(_ringHwnd);
+
+                _banner = new BannerForm();
+                _banner.CreateControl();
+                _bannerHwnd = _banner.Handle;
+                Exclude(_bannerHwnd);
 
                 _cursor = new CursorForm();
                 _cursor.CreateControl();
@@ -149,7 +155,8 @@ namespace Axon
                 _idleTimer.Tick += delegate
                 {
                     _idleTimer.Stop();
-                    try { _chrome.HideChrome(); } catch { }
+                    try { _ring.HideRing(); } catch { }
+                    try { _banner.HideBanner(); } catch { }
                     try { _cursor.HideCursor(); } catch { }
                 };
 
@@ -157,7 +164,11 @@ namespace Axon
                 Application.Run(_marker);
             }
             catch { _enabled = false; }
-            finally { _ready = false; _markerHwnd = _chromeHwnd = _cursorHwnd = IntPtr.Zero; }
+            finally
+            {
+                _ready = false;
+                _markerHwnd = _ringHwnd = _bannerHwnd = _cursorHwnd = IntPtr.Zero;
+            }
         }
 
         static void Exclude(IntPtr h)
@@ -165,18 +176,19 @@ namespace Axon
             try { SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE); } catch { }
         }
 
-        // Called by every acting op. Raises the ring, banner and cursor, and
-        // keeps them up until Axon has been quiet for a couple of seconds.
+        // Called by every acting op. Raises the chrome and keeps it up until Axon
+        // has been quiet for a couple of seconds.
         internal static void MarkActive()
         {
-            if (!Enabled || _chrome == null) return;
+            if (!Enabled || _banner == null) return;
             try
             {
-                _chrome.BeginInvoke((MethodInvoker)delegate
+                _banner.BeginInvoke((MethodInvoker)delegate
                 {
                     try
                     {
-                        _chrome.ShowChrome();
+                        _ring.ShowRing();
+                        _banner.ShowBanner();
                         if (_idleTimer != null) { _idleTimer.Stop(); _idleTimer.Start(); }
                     }
                     catch { }
@@ -217,12 +229,22 @@ namespace Axon
         {
             GraphicsPath p = new GraphicsPath();
             float d = radius * 2;
+            if (d > r.Height) d = r.Height;
+            if (d > r.Width) d = r.Width;
             p.AddArc(r.X, r.Y, d, d, 180, 90);
             p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
             p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
             p.CloseFigure();
             return p;
+        }
+
+        static Color Shade(Color c, float amount)
+        {
+            return Color.FromArgb(c.A,
+                (int)Math.Max(0, Math.Min(255, c.R * (1 - amount))),
+                (int)Math.Max(0, Math.Min(255, c.G * (1 - amount))),
+                (int)Math.Max(0, Math.Min(255, c.B * (1 - amount))));
         }
 
         // Shared base: layered, topmost, never activating, never focusable.
@@ -260,56 +282,148 @@ namespace Axon
             }
         }
 
-        // The ring and the banner. The one window here that accepts a click,
-        // because Stop has to be pressable.
-        sealed class ChromeForm : GhostForm
+        // Just the ring. Click-through, so the screen edges stay yours.
+        sealed class RingForm : GhostForm
         {
-            readonly Button _stop;
-            const int Pad = 18, Gap = 14, BannerH = 52, RingW = 4;
+            const int RingW = 4;
 
-            internal ChromeForm() : base(false)
-            {
-                _stop = new Button();
-                _stop.Text = "Stop";
-                _stop.FlatStyle = FlatStyle.Flat;
-                _stop.BackColor = Paper;
-                _stop.ForeColor = Ink;
-                _stop.FlatAppearance.BorderSize = 0;
-                _stop.FlatAppearance.MouseOverBackColor = Color.White;
-                _stop.Font = new Font(UiFont, 10.5f, FontStyle.Bold);
-                _stop.Size = new Size(96, 34);
-                _stop.Cursor = Cursors.Hand;
-                _stop.Click += delegate { _stopRequested = true; HideChrome(); };
-                Controls.Add(_stop);
-            }
+            internal RingForm() : base(true) { Bounds = SystemInformation.VirtualScreen; }
 
-            const string Message = "Claude is using your computer";
-
-            // Sized to its contents, so a bigger button widens the banner rather
-            // than squeezing the text onto one cramped line.
-            Rectangle BannerRect()
-            {
-                int textW;
-                using (Graphics g = CreateGraphics())
-                using (Font f = new Font(UiFont, 11f, FontStyle.Regular))
-                    textW = (int)Math.Ceiling(g.MeasureString(Message, f).Width);
-                int w = Pad + textW + Gap + _stop.Width + Pad;
-                return new Rectangle((Width - w) / 2, 10, w, BannerH);
-            }
-
-            // Called on every action, so it must do nothing once already up.
-            // Re-setting bounds or invalidating each time is what made it strobe.
-            internal void ShowChrome()
+            internal void ShowRing()
             {
                 if (Visible) return;
                 Bounds = SystemInformation.VirtualScreen;
-                Rectangle b = BannerRect();
-                _stop.Location = new Point(b.Right - Pad - _stop.Width, b.Y + (b.Height - _stop.Height) / 2);
                 Show();
                 TopMost = true;
             }
 
-            internal void HideChrome() { if (Visible) Hide(); }
+            internal void HideRing() { if (Visible) Hide(); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                using (Pen pen = new Pen(Claude, RingW))
+                {
+                    pen.Alignment = PenAlignment.Inset;
+                    e.Graphics.DrawRectangle(pen, new Rectangle(0, 0, Width - 1, Height - 1));
+                }
+            }
+        }
+
+        // The banner. Small, and the only surface Axon puts on screen that
+        // accepts a click - because Stop has to be pressable.
+        //
+        // Stop is an emergency brake, not a dialog button: it gets the highest
+        // contrast on screen and no ambiguity. Everything else here stays quiet.
+        // It is drawn rather than being a Button control, so it is a pill inside
+        // a pill instead of a square system widget bolted onto a rounded banner.
+        sealed class BannerForm : GhostForm
+        {
+            const string Message = "Claude is using your computer";
+            const string Action = "Stop";
+            const int H = 54, PadL = 20, PadR = 8, Gap = 16, StopH = 38, StopPadX = 20;
+            const int DotSize = 8, DotGap = 12;
+
+            Rectangle _stopRect;
+            bool _hover, _pressed;
+            readonly System.Windows.Forms.Timer _pulse;
+            float _phase;
+
+            internal BannerForm() : base(false)
+            {
+                Cursor = Cursors.Default;
+                // One piece of motion, and it carries meaning: the dot breathes
+                // while Axon is acting, and the whole banner leaves when it stops.
+                _pulse = new System.Windows.Forms.Timer();
+                _pulse.Interval = 66;
+                _pulse.Tick += delegate
+                {
+                    _phase += 0.06f;
+                    if (_phase > 1f) _phase -= 1f;
+                    Invalidate(DotRect());
+                };
+            }
+
+            Rectangle DotRect()
+            {
+                return new Rectangle(PadL, (H - DotSize) / 2 - 1, DotSize + 6, DotSize + 6);
+            }
+
+            int MeasureWidth()
+            {
+                int textW, actionW;
+                using (Graphics g = CreateGraphics())
+                using (Font f = new Font(UiFont, 11f, FontStyle.Regular))
+                using (Font a = new Font(UiFont, 10.5f, FontStyle.Bold))
+                {
+                    textW = (int)Math.Ceiling(g.MeasureString(Message, f).Width);
+                    actionW = (int)Math.Ceiling(g.MeasureString(Action, a).Width);
+                }
+                return PadL + DotSize + DotGap + textW + Gap + (actionW + StopPadX * 2) + PadR;
+            }
+
+            internal void ShowBanner()
+            {
+                if (Visible) { return; }
+                int w = MeasureWidth();
+                Rectangle vs = SystemInformation.VirtualScreen;
+                Bounds = new Rectangle(vs.X + (vs.Width - w) / 2, vs.Y + 14, w, H);
+                LayoutStop();
+                Show();
+                TopMost = true;
+                _pulse.Start();
+            }
+
+            void LayoutStop()
+            {
+                int actionW;
+                using (Graphics g = CreateGraphics())
+                using (Font a = new Font(UiFont, 10.5f, FontStyle.Bold))
+                    actionW = (int)Math.Ceiling(g.MeasureString(Action, a).Width);
+                int w = actionW + StopPadX * 2;
+                _stopRect = new Rectangle(Width - PadR - w, (H - StopH) / 2, w, StopH);
+            }
+
+            internal void HideBanner()
+            {
+                _pulse.Stop();
+                _hover = _pressed = false;
+                if (Visible) Hide();
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                bool over = _stopRect.Contains(e.Location);
+                if (over != _hover)
+                {
+                    _hover = over;
+                    Cursor = over ? Cursors.Hand : Cursors.Default;
+                    Invalidate(Inflate(_stopRect));
+                }
+                base.OnMouseMove(e);
+            }
+
+            protected override void OnMouseLeave(EventArgs e)
+            {
+                if (_hover || _pressed) { _hover = _pressed = false; Cursor = Cursors.Default; Invalidate(Inflate(_stopRect)); }
+                base.OnMouseLeave(e);
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                if (_stopRect.Contains(e.Location)) { _pressed = true; Invalidate(Inflate(_stopRect)); }
+                base.OnMouseDown(e);
+            }
+
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                bool fire = _pressed && _stopRect.Contains(e.Location);
+                _pressed = false;
+                Invalidate(Inflate(_stopRect));
+                if (fire) { RequestStop(); HideBanner(); try { _ring.HideRing(); _cursor.HideCursor(); } catch { } }
+                base.OnMouseUp(e);
+            }
+
+            static Rectangle Inflate(Rectangle r) { r.Inflate(3, 3); return r; }
 
             protected override void OnPaint(PaintEventArgs e)
             {
@@ -317,16 +431,19 @@ namespace Axon
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-                using (Pen pen = new Pen(Claude, RingW))
-                {
-                    pen.Alignment = PenAlignment.Inset;
-                    g.DrawRectangle(pen, new Rectangle(0, 0, Width - 1, Height - 1));
-                }
-
-                Rectangle b = BannerRect();
+                RectangleF body = new RectangleF(0, 0, Width, H);
                 using (SolidBrush bg = new SolidBrush(Claude))
-                using (GraphicsPath path = RoundRect(b, 10f))
+                using (GraphicsPath path = RoundRect(body, H / 2f))
                     g.FillPath(bg, path);
+
+                // Status dot: breathes while acting. This is the only motion, and
+                // it says something true - Axon is still working.
+                float t = (float)((Math.Sin(_phase * Math.PI * 2) + 1) / 2);
+                int alpha = (int)(110 + 145 * t);
+                float grow = 1f + 0.25f * t;
+                float ds = DotSize * grow;
+                using (SolidBrush dot = new SolidBrush(Color.FromArgb(alpha, Paper)))
+                    g.FillEllipse(dot, PadL + (DotSize - ds) / 2f, (H - ds) / 2f, ds, ds);
 
                 using (Font f = new Font(UiFont, 11f, FontStyle.Regular))
                 using (SolidBrush fg = new SolidBrush(Paper))
@@ -334,8 +451,24 @@ namespace Axon
                 {
                     sf.LineAlignment = StringAlignment.Center;
                     sf.FormatFlags = StringFormatFlags.NoWrap;
-                    g.DrawString(Message, f, fg,
-                        new RectangleF(b.X + Pad, b.Y, b.Width - Pad - Gap - _stop.Width, b.Height), sf);
+                    float x = PadL + DotSize + DotGap;
+                    g.DrawString(Message, f, fg, new RectangleF(x, 0, _stopRect.Left - Gap - x, H), sf);
+                }
+
+                // The brake. A pill inside a pill - concentric, so it belongs to
+                // the banner instead of sitting on top of it.
+                Color fill = _pressed ? Shade(Paper, 0.12f) : (_hover ? Color.White : Paper);
+                using (SolidBrush sb = new SolidBrush(fill))
+                using (GraphicsPath sp = RoundRect(_stopRect, _stopRect.Height / 2f))
+                    g.FillPath(sb, sp);
+
+                using (Font a = new Font(UiFont, 10.5f, FontStyle.Bold))
+                using (SolidBrush at = new SolidBrush(Ink))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    g.DrawString(Action, a, at, _stopRect, sf);
                 }
             }
         }
@@ -350,7 +483,7 @@ namespace Axon
 
             internal CursorForm() : base(true)
             {
-                Size = new Size(200, 60);
+                Size = new Size(220, 64);
                 // The label appears when your real pointer comes near Claude's.
                 // Polling beats hit-testing here: this window stays fully
                 // click-through, so it can never swallow a click meant for an app.
@@ -384,11 +517,10 @@ namespace Axon
 
             static GraphicsPath ArrowPath()
             {
-                // A standard pointer silhouette, scaled to ArrowW x ArrowH.
                 PointF[] pts = {
-                    new PointF(0f,   0f),   new PointF(0f,   23.5f), new PointF(6.2f, 18f),
-                    new PointF(9.7f, 26.3f),new PointF(13.8f,24.3f), new PointF(10.4f,16f),
-                    new PointF(16.6f,16f),
+                    new PointF(0f,    0f),    new PointF(0f,    23.5f), new PointF(6.2f,  18f),
+                    new PointF(9.7f,  26.3f), new PointF(13.8f, 24.3f), new PointF(10.4f, 16f),
+                    new PointF(16.6f, 16f),
                 };
                 GraphicsPath p = new GraphicsPath();
                 p.AddPolygon(pts);
@@ -406,7 +538,7 @@ namespace Axon
                 using (Pen edge = new Pen(Paper, 1.6f))
                 {
                     edge.LineJoin = LineJoin.Round;
-                    // Outline first so the pointer stays legible on any background.
+                    // Outline first, so the pointer stays legible on any background.
                     g.DrawPath(edge, arrow);
                     g.FillPath(fill, arrow);
                 }
@@ -417,12 +549,12 @@ namespace Axon
                 using (Font f = new Font(UiFont, 9f, FontStyle.Regular))
                 {
                     SizeF sz = g.MeasureString(label, f);
-                    RectangleF tag = new RectangleF(ArrowW + LabelGap, ArrowH * 0.45f, sz.Width + 16, sz.Height + 8);
+                    RectangleF tag = new RectangleF(ArrowW + LabelGap, ArrowH * 0.45f, sz.Width + 18, sz.Height + 10);
                     using (SolidBrush bg = new SolidBrush(Claude))
-                    using (GraphicsPath path = RoundRect(tag, 5f))
+                    using (GraphicsPath path = RoundRect(tag, tag.Height / 2f))
                         g.FillPath(bg, path);
                     using (SolidBrush fg = new SolidBrush(Paper))
-                        g.DrawString(label, f, fg, tag.X + 8, tag.Y + 4);
+                        g.DrawString(label, f, fg, tag.X + 9, tag.Y + 5);
                 }
             }
         }
@@ -473,12 +605,12 @@ namespace Axon
                 using (Font f = new Font(UiFont, 8.5f, FontStyle.Regular))
                 {
                     SizeF sz = g.MeasureString(_label, f);
-                    RectangleF tag = new RectangleF(4, 2, sz.Width + 14, TagH - 2);
+                    RectangleF tag = new RectangleF(4, 2, sz.Width + 16, TagH - 2);
                     using (SolidBrush bg = new SolidBrush(Claude))
-                    using (GraphicsPath path = RoundRect(tag, 4f))
+                    using (GraphicsPath path = RoundRect(tag, (TagH - 2) / 2f))
                         g.FillPath(bg, path);
                     using (SolidBrush fg = new SolidBrush(Paper))
-                        g.DrawString(_label, f, fg, tag.X + 7, tag.Y + 3);
+                        g.DrawString(_label, f, fg, tag.X + 8, tag.Y + 3);
                 }
             }
         }
