@@ -1,4 +1,4 @@
-// What Axon is allowed to touch.
+// What Computer Use is allowed to touch.
 //
 // Two independent gates:
 //   1. Tier - a property of the app itself. `blocked` apps are never readable
@@ -46,7 +46,7 @@ const SENSITIVE = {
   'discord':         'A messaging app can post as you in shared channels.',
 };
 
-// Shell-equivalent surfaces. Anything typed into these runs as you, so Axon
+// Shell-equivalent surfaces. Anything typed into these runs as you, so Computer Use
 // reads them but never sends input.
 
 // Dedicated terminals and IDEs: always shell, whatever they are showing.
@@ -60,7 +60,7 @@ const SHELL_APPS = [
 
 // Interpreters, which host both consoles and ordinary GUI windows. Process
 // name alone would misjudge these: a WinForms dialog launched from a script is
-// not a command prompt, and treating it as one would lock Axon out of every
+// not a command prompt, and treating it as one would lock Computer Use out of every
 // tool that happens to be script-hosted. Decide on the window class instead.
 const INTERPRETERS = ['cmd', 'powershell', 'pwsh', 'bash', 'sh', 'zsh', 'git-bash', 'python', 'pythonw', 'node', 'wscript', 'cscript'];
 
@@ -85,7 +85,7 @@ function normalise(name) {
 
 // Apps the user added via the plugin's blocked_apps setting. Additive only:
 // this can extend the blocklist, never shrink it.
-const USER_BLOCKED = String(process.env.AXON_BLOCKED_APPS || '')
+const USER_BLOCKED = String(process.env.CU_BLOCKED_APPS || '')
   .split(',')
   .map((s) => normalise(s.trim()))
   // An unset plugin setting can arrive as the literal placeholder text rather
@@ -104,10 +104,10 @@ export function classify(win) {
   }
   for (const c of candidates) {
     if (BLOCKED.some((b) => c === b || c.startsWith(b))) {
-      return { tier: TIER.BLOCKED, reason: 'This is a credential, elevation, or security surface. Axon never reads or drives these.' };
+      return { tier: TIER.BLOCKED, reason: 'This is a credential, elevation, or security surface. Computer Use never reads or drives these.' };
     }
   }
-  const shellReason = 'Typing here runs commands as you. Axon reads this window but never sends input to it.';
+  const shellReason = 'Typing here runs commands as you. Computer Use reads this window but never sends input to it.';
   for (const c of candidates) {
     if (SHELL_APPS.includes(c)) return { tier: TIER.SHELL, reason: shellReason };
   }
@@ -191,7 +191,7 @@ export class Policy {
         ok: false,
         code: 'self_window',
         message: 'That window belongs to this Claude Code session.',
-        hint: 'Axon excludes its own session so on-screen text cannot be fed back to the model as observed content.',
+        hint: 'Computer Use excludes its own session so on-screen text cannot be fed back to the model as observed content.',
       };
     }
     const { tier, reason } = classify(win);
@@ -214,7 +214,7 @@ export class Policy {
         ok: false,
         code: 'not_granted',
         message: `No grant for "${this.key(win)}" in this session.`,
-        hint: `Call axon_grant with app "${this.key(win)}" first. Grants last for this session only.`,
+        hint: `Call computer_grant with app "${this.key(win)}" first. Grants last for this session only.`,
       };
     }
     return { ok: true, tier };

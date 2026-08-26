@@ -1,30 +1,37 @@
 {
-  "name": "axon",
-  "displayName": "Axon",
+  "name": "computer-use",
+  "displayName": "Computer Use",
   "version": "0.1.0",
-  "description": "Semantic computer use for Windows and macOS. Reads apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs ~23x fewer tokens. Knows the difference between your input and its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
+  "description": "Codex-style computer use for Claude Code. Drives Windows and macOS apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs about 20x fewer tokens. Knows your input from its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
   "author": {
     "name": "ridelink0",
     "url": "https://github.com/ridelink0"
   },
-  "homepage": "https://github.com/ridelink0/axon",
-  "repository": "https://github.com/ridelink0/axon",
+  "homepage": "https://github.com/ridelink0/claude-computer-use",
+  "repository": "https://github.com/ridelink0/claude-computer-use",
   "license": "MIT",
   "keywords": [
+    "computer use",
     "computer-use",
-    "windows",
-    "ui-automation",
-    "accessibility",
-    "desktop-automation",
-    "gui",
-    "agent"
+    "codex computer use",
+    "codex",
+    "desktop automation",
+    "gui automation",
+    "windows automation",
+    "accessibility tree",
+    "ui automation",
+    "screen control",
+    "click",
+    "automate apps",
+    "desktop agent",
+    "macos automation"
   ],
   "mcpServers": "./.mcp.json",
   "userConfig": {
     "blocked_apps": {
       "type": "string",
       "title": "Additional blocked apps",
-      "description": "Comma-separated process names Axon must never read or drive, on top of its built-in blocklist. Example: myvault,internal-admin",
+      "description": "Comma-separated process names Computer Use must never read or drive, on top of its built-in blocklist. Example: myvault,internal-admin",
       "required": false
     },
     "coexist_mode": {
@@ -41,7 +48,7 @@
       "default": 1200,
       "min": 200,
       "max": 30000,
-      "description": "How long you must be quiet before Axon considers the machine free."
+      "description": "How long you must be quiet before Computer Use considers the machine free."
     }
   }
 }

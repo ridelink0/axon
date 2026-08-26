@@ -1,12 +1,12 @@
 # Generates a throwaway WinForms window with known controls, purely as an
-# Axon test target. Nothing pre-existing on the machine is ever used for tests.
+# Computer Use test target. Nothing pre-existing on the machine is ever used for tests.
 # Prints its window title and PID as JSON, then blocks until closed.
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$title = "Axon Test Target $PID"
+$title = "Computer Use Test Target $PID"
 
 $form                = New-Object System.Windows.Forms.Form
 $form.Text           = $title

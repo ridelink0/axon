@@ -1,4 +1,4 @@
-// Compiles the Axon host from the C# source in this repo using the csc.exe
+// Compiles the Computer Use host from the C# source in this repo using the csc.exe
 // that ships with the Windows .NET Framework. No SDK, no toolchain, no npm
 // native addon, no download.
 //
@@ -27,9 +27,9 @@ export const SOURCE = SOURCES[0];
 export function dataDir() {
   // The compiled host lives in plugin data, not in the plugin directory, so it
   // survives plugin updates and never lands inside a git checkout.
-  const fromEnv = process.env.AXON_PLUGIN_DATA || process.env.CLAUDE_PLUGIN_DATA;
+  const fromEnv = process.env.CU_PLUGIN_DATA || process.env.CLAUDE_PLUGIN_DATA;
   if (fromEnv && fromEnv.trim() && !fromEnv.includes('${')) return fromEnv.trim();
-  return path.join(os.homedir(), '.claude', 'plugins', 'data', 'axon');
+  return path.join(os.homedir(), '.claude', 'plugins', 'data', 'computer-use');
 }
 
 export function binDir() {
@@ -111,7 +111,7 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
   if (process.platform === 'darwin') return ensureMacHost({ force, log });
   if (process.platform !== 'win32') {
     throw new BuildError(
-      'Axon runs on Windows and macOS. This looks like ' + process.platform + '.',
+      'Computer Use runs on Windows and macOS. This looks like ' + process.platform + '.',
       'Linux would need an AT-SPI driver, which does not exist yet.'
     );
   }
@@ -120,7 +120,7 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
   if (!csc) {
     throw new BuildError(
       'Could not find the in-box C# compiler (csc.exe) under %WINDIR%\\Microsoft.NET.',
-      'Axon needs the .NET Framework 4.x runtime, which is part of Windows. On a stripped image, enable it in Windows Features.'
+      'Computer Use needs the .NET Framework 4.x runtime, which is part of Windows. On a stripped image, enable it in Windows Features.'
     );
   }
 
@@ -174,7 +174,7 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
   }
   if (res.status !== 0) {
     const out = ((res.stdout || '') + (res.stderr || '')).trim();
-    throw new BuildError('Compiling the Axon host failed.', out.slice(0, 2000));
+    throw new BuildError('Compiling the Computer Use host failed.', out.slice(0, 2000));
   }
   if (!fs.existsSync(temp)) {
     throw new BuildError('The compiler reported success but produced no executable.', null);
@@ -199,7 +199,7 @@ export function ensureHost({ force = false, log = () => {} } = {}) {
 
 // The first execution of a newly written binary is slow: a real-time antivirus
 // scan runs before it starts, and on Windows that costs seconds. Paying it here,
-// once, at build time, means the first thing Claude asks Axon to do is not
+// once, at build time, means the first thing Claude asks Computer Use to do is not
 // mysteriously slow.
 function warmUp(exe, log) {
   try {
@@ -260,7 +260,7 @@ function ensureMacHost({ force = false, log = () => {} } = {}) {
     throw new BuildError('Compiling the macOS host failed.',
       out.slice(0, 2000) + String.fromCharCode(10, 10) +
       'The macOS host is a port that has not been validated on hardware. ' +
-      'Please open an issue at https://github.com/ridelink0/axon/issues with this output.');
+      'Please open an issue at https://github.com/ridelink0/claude-computer-use/issues with this output.');
   }
   try { fs.chmodSync(temp, 0o755); } catch {}
   try { fs.renameSync(temp, exe); }

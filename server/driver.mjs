@@ -1,5 +1,5 @@
 // Owns the long-lived host process and the line-delimited JSON protocol that
-// runs over its stdio. One host per Axon session keeps AutomationElement
+// runs over its stdio. One host per Computer Use session keeps AutomationElement
 // references alive between calls, which is what makes a tree lookup cost
 // milliseconds instead of re-walking from the desktop root every action.
 
@@ -175,7 +175,7 @@ export class Driver {
         new Promise((r) => setTimeout(r, 1500)),
       ]);
     } catch {}
-    // Axon never terminates a process it did not spawn. This is its own host.
+    // Computer Use never terminates a process it did not spawn. This is its own host.
     try { if (!p.killed) p.kill(); } catch {}
     this.proc = null;
     this.info = null;

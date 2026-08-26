@@ -65,7 +65,7 @@ async function main() {
   const init = await c.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   check('initialize echoes protocol', init.protocolVersion === '2025-06-18', init.protocolVersion);
   check('declares tools capability', !!init.capabilities.tools);
-  check('names itself', init.serverInfo.name === 'axon');
+  check('names itself', init.serverInfo.name === 'computer-use');
   const initOld = await c.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: {} });
   check('negotiates an older protocol', initOld.protocolVersion === '2024-11-05', initOld.protocolVersion);
   c.notify('notifications/initialized', {});
@@ -75,7 +75,7 @@ async function main() {
   const schemaTokens = tok(JSON.stringify(tools));
   console.log(`     ${tools.length} tools, schema ~${schemaTokens} tokens (paid every turn)`);
   check('tools listed', tools.length > 0);
-  check('all tools namespaced axon_', tools.every((t) => t.name.startsWith('axon_')));
+  check('all tools namespaced computer_', tools.every((t) => t.name.startsWith('computer_')));
   check('no tool collides with built-in computer use',
     !tools.some((t) => /^(computer|screenshot|mouse|keyboard)$/.test(t.name)));
   check('every tool documents itself', tools.every((t) => t.description && t.description.length > 20));
@@ -86,18 +86,18 @@ async function main() {
   console.log(`     "${target.title}"`);
   await new Promise((r) => setTimeout(r, 700));
 
-  console.log('\n-- axon_apps --');
-  const apps = await c.call('axon_apps');
+  console.log('\n-- computer_apps --');
+  const apps = await c.call('computer_apps');
   const appsText = body(apps);
-  check('lists our target', appsText.includes('Axon Test Target'), appsText.slice(0, 200));
+  check('lists our target', appsText.includes('Computer Use Test Target'), appsText.slice(0, 200));
   check('shows a tier column', appsText.includes('tier:'));
-  const m = appsText.split('\n').find((l) => l.includes('Axon Test Target'));
+  const m = appsText.split('\n').find((l) => l.includes('Computer Use Test Target'));
   const hwnd = m && Number(m.trim().split(/\s+/)[0]);
   check('hwnd parseable from listing', Number.isFinite(hwnd) && hwnd > 0, String(hwnd));
   console.log(`     listing ~${tok(appsText)} tokens`);
 
   console.log('\n-- snapshot cost --');
-  const snap = await c.call('axon_snapshot', { hwnd });
+  const snap = await c.call('computer_snapshot', { hwnd });
   const snapText = body(snap);
   const snapTokens = tok(snapText);
   console.log(`     default snapshot ~${snapTokens} tokens`);
@@ -111,19 +111,19 @@ async function main() {
   check('omits rects by default', !/\(\d+,\d+ \d+x\d+\)/.test(snapText));
   check('prunes layout-only nodes', /layout-only hidden/.test(snapText) || true);
 
-  const withRects = body(await c.call('axon_snapshot', { hwnd, with_rects: true }));
+  const withRects = body(await c.call('computer_snapshot', { hwnd, with_rects: true }));
   check('with_rects adds bounding boxes', /\(\d+,\d+ \d+x\d+\)/.test(withRects));
   check('with_rects costs more', tok(withRects) > snapTokens, `${tok(withRects)} vs ${snapTokens}`);
 
-  const tight = body(await c.call('axon_snapshot', { hwnd, text_limit: 40 }));
+  const tight = body(await c.call('computer_snapshot', { hwnd, text_limit: 40 }));
   check('text_limit shrinks output', tok(tight) < snapTokens, `${tok(tight)} vs ${snapTokens}`);
 
-  const lean = body(await c.call('axon_snapshot', { hwnd, interactive_only: true }));
+  const lean = body(await c.call('computer_snapshot', { hwnd, interactive_only: true }));
   const leanTokens = tok(lean);
   console.log(`     interactive_only  ~${leanTokens} tokens`);
   check('interactive_only is cheaper', leanTokens < snapTokens, `${leanTokens} vs ${snapTokens}`);
 
-  const shot = await c.call('axon_screenshot', { hwnd });
+  const shot = await c.call('computer_screenshot', { hwnd });
   const img = (shot.content || []).find((x) => x.type === 'image');
   const shotTokens = img ? Math.round((img.data.length) / 4) : 0;
   console.log(`     window screenshot ~${shotTokens} tokens`);
@@ -132,38 +132,38 @@ async function main() {
   console.log(`     ratio: screenshot is ${(shotTokens / snapTokens).toFixed(1)}x the tree`);
 
   console.log('\n-- permission gate --');
-  const ungranted = await c.call('axon_click', { hwnd, selector: { name: 'Press Me' } });
+  const ungranted = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
   check('acting without a grant is refused', ungranted.isError === true && body(ungranted).includes('not_granted'), body(ungranted));
-  check('refusal names the fix', body(ungranted).includes('axon_grant'));
+  check('refusal names the fix', body(ungranted).includes('computer_grant'));
 
-  const granted = await c.call('axon_grant', { hwnd });
+  const granted = await c.call('computer_grant', { hwnd });
   check('grant succeeds for a standard app', !granted.isError, body(granted));
 
-  const clicked = await c.call('axon_click', { hwnd, selector: { name: 'Press Me' } });
+  const clicked = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
   check('click works after grant', !clicked.isError && body(clicked).includes('invoke_pattern'), body(clicked));
 
-  const filled = await c.call('axon_type', { hwnd, selector: { name: 'Name field' }, text: 'Gerald', replace: true });
+  const filled = await c.call('computer_type', { hwnd, selector: { name: 'Name field' }, text: 'Gerald', replace: true });
   check('type replace:true uses the value pattern', body(filled).includes('value_pattern'), body(filled));
-  const after = body(await c.call('axon_snapshot', { hwnd }));
+  const after = body(await c.call('computer_snapshot', { hwnd }));
   check('replaced text is readable back', after.includes('Gerald'), (after.split('\n').find((l) => l.includes('Name field')) || ''));
 
-  const revoked = await c.call('axon_grant', { revoke: 'all' });
+  const revoked = await c.call('computer_grant', { revoke: 'all' });
   check('revoke reports what it dropped', body(revoked).includes('revoked'), body(revoked));
-  const afterRevoke = await c.call('axon_click', { hwnd, selector: { name: 'Press Me' } });
+  const afterRevoke = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
   check('revoke actually re-locks', afterRevoke.isError === true, body(afterRevoke));
 
   console.log('\n-- reading never needs a grant --');
-  const readAfterRevoke = await c.call('axon_snapshot', { hwnd });
+  const readAfterRevoke = await c.call('computer_snapshot', { hwnd });
   check('snapshot still allowed with no grant', !readAfterRevoke.isError);
 
   console.log('\n-- blocked tiers --');
-  const allApps = body(await c.call('axon_apps', { include_hidden: true }));
+  const allApps = body(await c.call('computer_apps', { include_hidden: true }));
   const shellLine = allApps.split('\n').find((l) => /\bshell\b/.test(l));
   if (shellLine) {
     const shellHwnd = Number(shellLine.trim().split(/\s+/)[0]);
-    const g = await c.call('axon_grant', { hwnd: shellHwnd });
+    const g = await c.call('computer_grant', { hwnd: shellHwnd });
     check('shell-tier app refuses an input grant', g.isError === true, body(g));
-    const r = await c.call('axon_snapshot', { hwnd: shellHwnd });
+    const r = await c.call('computer_snapshot', { hwnd: shellHwnd });
     check('shell-tier app is still readable', !r.isError);
     check('shell read carries an untrusted-content warning', body(r).includes('untrusted'), body(r).slice(0, 160));
   } else {
@@ -177,23 +177,23 @@ async function main() {
     // never land on the cover.
     const b = await spawnTarget();
     await new Promise((r) => setTimeout(r, 900));
-    const listing = body(await c.call('axon_apps'));
+    const listing = body(await c.call('computer_apps'));
     const row = (title) => listing.split('\n').find((l) => l.includes(title));
     const hwndB = Number((row(b.title) || '').trim().split(/\s+/)[0]);
     const covered = await spawnTarget();
     await new Promise((r) => setTimeout(r, 900));
-    const listing2 = body(await c.call('axon_apps'));
+    const listing2 = body(await c.call('computer_apps'));
     const hwndTop = Number((listing2.split('\n').find((l) => l.includes(covered.title)) || '').trim().split(/\s+/)[0]);
 
     if (Number.isFinite(hwndB) && Number.isFinite(hwndTop) && hwndB !== hwndTop) {
-      await c.call('axon_grant', { hwnd: hwndB });
-      await c.call('axon_grant', { hwnd: hwndTop });
-      await c.call('axon_focus', { hwnd: hwndTop });   // put the cover in front
-      const snapB = await c.call('axon_snapshot', { hwnd: hwndB });
+      await c.call('computer_grant', { hwnd: hwndB });
+      await c.call('computer_grant', { hwnd: hwndTop });
+      await c.call('computer_focus', { hwnd: hwndTop });   // put the cover in front
+      const snapB = await c.call('computer_snapshot', { hwnd: hwndB });
       const idx = Number((body(snapB).split('\n').find((l) => l.includes('"Press Me"')) || '').match(/\[(\d+)\]/)?.[1]);
-      const r = await c.call('axon_click', { hwnd: hwndB, snapshot_id: null, index: idx, physical: true });
+      const r = await c.call('computer_click', { hwnd: hwndB, snapshot_id: null, index: idx, physical: true });
       // Either it refused, or it raised the target first. Both are safe.
-      const topAfter = body(await c.call('axon_snapshot', { hwnd: hwndTop }));
+      const topAfter = body(await c.call('computer_snapshot', { hwnd: hwndTop }));
       check('covered click never hits the covering window',
         !topAfter.includes('pressed:'), r.isError ? 'refused: ' + body(r).slice(0, 60) : 'raised target first');
     } else {
@@ -204,15 +204,15 @@ async function main() {
   }
 
   console.log('\n-- hidden windows still resolve by handle --');
-  const visibleHwnds = new Set(body(await c.call('axon_apps')).split('\n')
+  const visibleHwnds = new Set(body(await c.call('computer_apps')).split('\n')
     .map((l) => Number(l.trim().split(/\s+/)[0])).filter(Number.isFinite));
   const hiddenOnly = allApps.split('\n')
     .map((l) => Number(l.trim().split(/\s+/)[0]))
     .filter((h) => Number.isFinite(h) && h > 0 && !visibleHwnds.has(h));
   if (hiddenOnly.length) {
     // A minimized window is filtered from listings, but an explicit handle must
-    // still resolve or axon_focus could never raise one.
-    const r = await c.call('axon_snapshot', { hwnd: hiddenOnly[0] });
+    // still resolve or computer_focus could never raise one.
+    const r = await c.call('computer_snapshot', { hwnd: hiddenOnly[0] });
     check('hidden window resolves by explicit hwnd',
       !(r.isError && body(r).includes('window_not_found')), body(r).slice(0, 120));
   } else {
@@ -220,7 +220,7 @@ async function main() {
   }
 
   console.log('\n-- with_image degrades instead of failing --');
-  const withImg = await c.call('axon_snapshot', { hwnd, with_image: true });
+  const withImg = await c.call('computer_snapshot', { hwnd, with_image: true });
   check('with_image returns the tree', body(withImg).includes('Press Me'));
   const hasImg = (withImg.content || []).some((x) => x.type === 'image');
   check('with_image attaches an image or explains why not',
@@ -228,10 +228,10 @@ async function main() {
 
   console.log('\n-- errors surface as tool errors, not crashes --');
   const cases = [
-    ['bad hwnd',        () => c.call('axon_snapshot', { hwnd: 999999 }),                    'window_not_found'],
-    ['no target',       () => c.call('axon_click', {}),                                     'no_target'],
-    ['bad key',         () => c.call('axon_key', { hwnd, keys: 'ctrl+nope' }),              null],
-    ['unknown tool',    () => c.call('axon_nonexistent', {}),                               null],
+    ['bad hwnd',        () => c.call('computer_snapshot', { hwnd: 999999 }),                    'window_not_found'],
+    ['no target',       () => c.call('computer_click', {}),                                     'no_target'],
+    ['bad key',         () => c.call('computer_key', { hwnd, keys: 'ctrl+nope' }),              null],
+    ['unknown tool',    () => c.call('computer_nonexistent', {}),                               null],
   ];
   for (const [label, fn, expect] of cases) {
     let r, threw = false;
@@ -242,13 +242,13 @@ async function main() {
   }
 
   console.log('\n-- status --');
-  const st = body(await c.call('axon_status'));
+  const st = body(await c.call('computer_status'));
   check('status reports dpi mode', /dpi mode: per-monitor/.test(st), st.split('\n')[1]);
   check('status accounts for screenshots', /screenshots taken: [1-9]/.test(st), st);
 
   console.log('\n-- cleanup --');
-  await c.call('axon_grant', { hwnd });
-  const closed = await c.call('axon_close_window', { hwnd });
+  await c.call('computer_grant', { hwnd });
+  const closed = await c.call('computer_close_window', { hwnd });
   check('closes our own target', !closed.isError, body(closed));
 
   c.stop();

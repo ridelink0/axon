@@ -1,13 +1,13 @@
 {
   "mcpServers": {
-    "axon": {
+    "computer-use": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"],
       "env": {
-        "AXON_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
-        "AXON_BLOCKED_APPS": "${user_config.blocked_apps}",
-        "AXON_MODE": "${user_config.coexist_mode}",
-        "AXON_IDLE_MS": "${user_config.user_idle_ms}"
+        "CU_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "CU_BLOCKED_APPS": "${user_config.blocked_apps}",
+        "CU_MODE": "${user_config.coexist_mode}",
+        "CU_IDLE_MS": "${user_config.user_idle_ms}"
       }
     }
   }

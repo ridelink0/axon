@@ -66,7 +66,7 @@ console.log('\n-- standard flow --');
   check('reading needs no grant', p.checkRead(w).ok === true);
   check('acting without a grant is refused', p.checkAct(w).ok === false);
   check('refusal code is not_granted', p.checkAct(w).code === 'not_granted');
-  check('refusal names the tool to call', /axon_grant/.test(p.checkAct(w).hint));
+  check('refusal names the tool to call', /computer_grant/.test(p.checkAct(w).hint));
   p.grant(w);
   check('acting after a grant is allowed', p.checkAct(w).ok === true);
   check('revoke re-locks', p.revoke('myapp') === true && p.checkAct(w).ok === false);

@@ -140,8 +140,12 @@ async function main() {
   console.log(`     full: ${shotFull.width}x${shotFull.height} ${Math.round(shotFull.bytes/1024)}KB -> ~${Math.round(shotFull.data.length/4)} tokens`);
   const shotWin = (await d.call('screenshot', { hwnd, max_width: 900, quality: 55 })).result;
   check('window screenshot encodes', shotWin.data && shotWin.data.length > 1000);
-  check('window shot is smaller than full screen', shotWin.bytes < shotFull.bytes,
-        `win=${shotWin.bytes} full=${shotFull.bytes}`);
+  // Compare captured pixel area, not JPEG byte size: a detailed small window can
+  // compress to more bytes than a near-blank large desktop, so byte size is not
+  // the invariant. The window region being smaller than the whole screen is.
+  check('window shot covers a smaller region than full screen',
+        (shotWin.source[2] * shotWin.source[3]) < (shotFull.source[2] * shotFull.source[3]),
+        `win=${shotWin.source[2]}x${shotWin.source[3]} full=${shotFull.source[2]}x${shotFull.source[3]}`);
   console.log(`     window: ${shotWin.width}x${shotWin.height} ${Math.round(shotWin.bytes/1024)}KB -> ~${Math.round(shotWin.data.length/4)} tokens`);
 
   // The core economic claim of the whole design.

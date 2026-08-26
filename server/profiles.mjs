@@ -35,7 +35,7 @@ const PROFILES = [
   },
   {
     match: ['mspaint'],
-    hint: 'The canvas is a single opaque element with no inner structure. Use axon_screenshot and point targeting for anything on the canvas; the tree only covers the tools and menus around it.',
+    hint: 'The canvas is a single opaque element with no inner structure. Use computer_screenshot and point targeting for anything on the canvas; the tree only covers the tools and menus around it.',
   },
   {
     match: ['calc'],

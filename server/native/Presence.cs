@@ -1,14 +1,14 @@
-// Presence - tells Axon when the human is actually using the machine.
+// Presence - tells Computer Use when the human is actually using the machine.
 //
-// The whole point of Axon coexisting on one desktop is knowing the difference
-// between input the user produced and input Axon produced. Windows answers that
+// The whole point of Computer Use coexisting on one desktop is knowing the difference
+// between input the user produced and input Computer Use produced. Windows answers that
 // exactly: the kernel stamps every synthetic event with an injected flag that
 // the injecting process cannot clear, and low-level hooks can read it.
 //
 //   MSLLHOOKSTRUCT.flags  bit 0 (0x01) LLMHF_INJECTED
 //   KBDLLHOOKSTRUCT.flags bit 4 (0x10) LLKHF_INJECTED
 //
-// So Axon's own SendInput calls never register as the user being busy, and a
+// So Computer Use's own SendInput calls never register as the user being busy, and a
 // real hand on the mouse always does.
 //
 // The callbacks run on the thread that installed the hook and are subject to
@@ -71,7 +71,7 @@ namespace Axon
         static long _injectedEvents;
         static int _lastKind;           // 1 = mouse, 2 = keyboard
         static long _commitWindow;      // which window the user last acted IN
-        static long _lastSelfInject;    // when Axon itself last sent input
+        static long _lastSelfInject;    // when Computer Use itself last sent input
         static uint _threadId;
         static volatile bool _hooksOk;
         static volatile bool _started;
@@ -80,6 +80,11 @@ namespace Axon
         internal static bool HooksOk { get { return _hooksOk; } }
 
         internal static void NoteSelfInput() { Interlocked.Exchange(ref _lastSelfInject, DateTime.UtcNow.Ticks); }
+
+        // Raised when the user presses Escape. The host wires this to release any
+        // input block and halt the run - the guaranteed way to take the machine
+        // back, whatever else is going on.
+        internal static Action OnPanic;
 
         // A freshly compiled, unsigned binary that installs global keyboard
         // hooks looks exactly like a keylogger, and Windows security tooling can
@@ -91,8 +96,8 @@ namespace Axon
         }
 
         // GetLastInputInfo needs no hook. It counts synthetic input too, so
-        // anything arriving right after one of Axon's own injections is treated
-        // as Axon's rather than the user's.
+        // anything arriving right after one of Computer Use's own injections is treated
+        // as Computer Use's rather than the user's.
         static int FallbackIdleMs()
         {
             LASTINPUTINFO lii = new LASTINPUTINFO();
@@ -115,7 +120,7 @@ namespace Axon
 
             _thread = new Thread(Pump);
             _thread.IsBackground = true;
-            _thread.Name = "axon-presence";
+            _thread.Name = "computer-use-presence";
             _thread.Start();
 
             // Give the hooks a moment to install so the first presence query is
@@ -194,6 +199,15 @@ namespace Axon
                     Interlocked.Exchange(ref _commitWindow, (long)GetForegroundWindow());
                     Interlocked.Increment(ref _realEvents);
                     _lastKind = 2;
+                    // Escape is the way out, checked before anything else so it
+                    // works when nothing else does. This still fires while
+                    // physical input is blocked: BlockInput stops input reaching
+                    // other applications, but the thread that blocked it keeps
+                    // seeing it, and that thread is this one.
+                    if (Marshal.ReadInt32(lParam, 0) == 0x1B && OnPanic != null)
+                    {
+                        try { OnPanic(); } catch { }
+                    }
                 }
             }
             return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
@@ -225,16 +239,16 @@ namespace Axon
             }
         }
 
-        // With no working hooks Axon cannot tell the user apart from itself, so
+        // With no working hooks Computer Use cannot tell the user apart from itself, so
         // it reports "not active" and degrades to acting immediately - the way
         // it behaved before coexistence existed. That is a real loss of
-        // courtesy, so axon_status says so loudly rather than quietly pretending
+        // courtesy, so computer_status says so loudly rather than quietly pretending
         // the desktop is free.
         internal static bool Available { get { return true; } }
 
         internal static bool Active(int thresholdMs) { return IdleMs < thresholdMs; }
 
-        // The window the user last clicked or typed in. Lets Axon tell "they are
+        // The window the user last clicked or typed in. Lets Computer Use tell "they are
         // busy somewhere" apart from "they are busy in the window I want", which
         // is the difference between coexisting and getting in their way.
         internal static long CommitWindow { get { return Interlocked.Read(ref _commitWindow); } }

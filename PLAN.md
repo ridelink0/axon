@@ -1,4 +1,4 @@
-# Axon — build plan
+# Computer Use — build plan
 
 ## What this is
 
@@ -7,7 +7,7 @@ the architecture that makes OpenAI Codex's computer use good — without touchin
 or overriding Claude Code's built-in `computer-use` MCP server.
 
 It cannot conflict: Claude Code's built-in computer use is **macOS-only** and Pro/Max-gated.
-On Windows there is nothing in the CLI at all. Axon fills that hole and is additive on macOS
+On Windows there is nothing in the CLI at all. Computer Use fills that hole and is additive on macOS
 (different server name, different tool names, off until an app is granted).
 
 ## Research conclusions that drive the design
@@ -48,22 +48,22 @@ Second structural difference: Claude Code takes a **machine-wide lock**, allows 
 a time, and **hides your other apps** while it works. Codex gives the agent its own cursor and
 leaves your desktop alone.
 
-### What Axon takes, and what it deliberately does not
+### What Computer Use takes, and what it deliberately does not
 
 Takes: tree-first router, semantic selectors, tiered perception (appshot), per-app approval,
 narrow task scoping, verify-after-act, structured errors instead of silent coordinate misses.
 
 Does not take: background/virtual-desktop isolation. On Windows that needs a separate desktop
-or session and Codex itself does not do it there. Axon is honest about being foreground.
+or session and Codex itself does not do it there. Computer Use is honest about being foreground.
 
 ## Architecture
 
 ```
-axon/
+computer-use/
 ├── .claude-plugin/
 │   ├── plugin.json          manifest
-│   └── marketplace.json     so `/plugin marketplace add ridelink0/axon` works
-├── .mcp.json                declares the axon stdio MCP server
+│   └── marketplace.json     so `/plugin marketplace add ridelink0/claude-computer-use` works
+├── .mcp.json                declares the computer-use stdio MCP server
 ├── server/
 │   ├── index.mjs            MCP server: JSON-RPC over stdio, hand-rolled, zero deps
 │   ├── driver.mjs           owns the PowerShell host process, request/response framing
@@ -71,7 +71,7 @@ axon/
 │   ├── budget.mjs           screenshot token budget + downscale policy
 │   └── ps/axon-host.ps1     long-lived UIA host, line-delimited JSON protocol
 ├── skills/computer-use/SKILL.md   teaches the tree-first discipline
-├── commands/                /axon:status /axon:apps /axon:grant /axon:revoke
+├── commands/                /computer-use:status /computer-use:apps /computer-use:grant /computer-use:revoke
 ├── hooks/hooks.json         PreToolUse safety gate
 ├── evals/                   `claude plugin eval` cases
 └── README.md
@@ -96,12 +96,12 @@ theoretical.
 `element_not_found`, `snapshot_stale`, `window_gone` — never a silent click at the wrong spot.
 
 **Tiered perception.**
-- `axon_list_apps` — cheap, no image, filtered top-level windows
-- `axon_snapshot` — the appshot: indexed semantic tree of one window, text included, image optional
-- `axon_screenshot` — explicit, budgeted, downscaled JPEG, for canvas/visual verification only
+- `computer_list_apps` — cheap, no image, filtered top-level windows
+- `computer_snapshot` — the appshot: indexed semantic tree of one window, text included, image optional
+- `computer_screenshot` — explicit, budgeted, downscaled JPEG, for canvas/visual verification only
 
-**Never override the built-in.** Separate MCP server name, `axon_*` tool names, namespaced as
-`mcp__plugin_axon_axon__*`. No hook or config touches the `computer-use` server.
+**Never override the built-in.** Separate MCP server name, `computer_*` tool names, namespaced as
+`mcp__plugin_computer_computer__*`. No hook or config touches the `computer-use` server.
 
 ### Safety model
 
@@ -109,7 +109,7 @@ Shaped in part by a real mistake made during research: killing a PID that looked
 throwaway launcher destroyed an unrelated unsaved document, because Windows 11 Notepad runs
 all its windows under one shared process.
 
-- **No process termination tool exists in Axon at all.** Not `kill`, not `close_app`. The
+- **No process termination tool exists in Computer Use at all.** Not `kill`, not `close_app`. The
   worst it can do to a process is close a specific window via `WM_CLOSE` to a specific HWND,
   and only for a granted app.
 - **Per-app grant, per session.** Nothing is actable until granted. Snapshot/list are
@@ -133,5 +133,5 @@ all its windows under one shared process.
 
 ## Test targets
 
-Only apps Axon itself creates: a generated WinForms scratch app with known controls
+Only apps Computer Use itself creates: a generated WinForms scratch app with known controls
 (button, textbox, checkbox, list, tab). No system apps, no user apps, nothing pre-existing.

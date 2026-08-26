@@ -1,6 +1,6 @@
-// Axon host - persistent Windows UI Automation driver.
+// Computer Use host - persistent Windows UI Automation driver.
 //
-// Speaks line-delimited JSON on stdin/stdout. One host per Axon session, so
+// Speaks line-delimited JSON on stdin/stdout. One host per Computer Use session, so
 // AutomationElement references stay live between calls and a tree lookup costs
 // milliseconds instead of re-walking from the desktop root every time.
 //
@@ -48,6 +48,75 @@ namespace Axon
         [DllImport("kernel32.dll")] internal static extern uint GetCurrentThreadId();
         [DllImport("dwmapi.dll")] internal static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int val, int size);
         [DllImport("user32.dll", SetLastError = true)] internal static extern uint SendInput(uint n, INPUT[] inputs, int size);
+        [DllImport("user32.dll")] internal static extern bool BlockInput(bool block);
+
+        // Exclusive mode: hold off the user's physical mouse and keyboard for the
+        // length of a single action, so their hand cannot land in the middle of
+        // one. BlockInput stops physical input only - synthetic input still goes
+        // through, which is what makes this usable at all.
+        //
+        // Four independent ways out, because a tool that can lock you out of your
+        // own machine must never be able to do so permanently:
+        //   1. Esc. The keyboard hook lives in this same process, and the blocking
+        //      thread still receives input, so Esc reaches us and releases.
+        //   2. A watchdog releases unconditionally after ReleaseAfterMs.
+        //   3. Scope is one action - milliseconds - never a whole run.
+        //   4. Windows releases it by itself the moment this process exits, and
+        //      Ctrl+Alt+Del can never be blocked by anything.
+        const int ReleaseAfterMs = 4000;
+        static readonly object _blockLock = new object();
+        static bool _blocked;
+        static DateTime _blockedAt;
+        static System.Threading.Thread _watchdog;
+
+        internal static bool BeginExclusive()
+        {
+            lock (_blockLock)
+            {
+                if (_blocked) return true;
+                if (!BlockInput(true)) return false;
+                _blocked = true;
+                _blockedAt = DateTime.UtcNow;
+                StartWatchdog();
+                return true;
+            }
+        }
+
+        internal static void EndExclusive()
+        {
+            lock (_blockLock)
+            {
+                if (!_blocked) return;
+                BlockInput(false);
+                _blocked = false;
+            }
+        }
+
+        internal static bool InputBlocked { get { lock (_blockLock) { return _blocked; } } }
+
+        static void StartWatchdog()
+        {
+            if (_watchdog != null) return;
+            _watchdog = new System.Threading.Thread(delegate()
+            {
+                // Nothing about a stuck action may leave the machine unusable.
+                while (true)
+                {
+                    System.Threading.Thread.Sleep(200);
+                    lock (_blockLock)
+                    {
+                        if (_blocked && (DateTime.UtcNow - _blockedAt).TotalMilliseconds > ReleaseAfterMs)
+                        {
+                            BlockInput(false);
+                            _blocked = false;
+                        }
+                    }
+                }
+            });
+            _watchdog.IsBackground = true;
+            _watchdog.Name = "computer-use-input-watchdog";
+            _watchdog.Start();
+        }
 
         [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int Left, Top, Right, Bottom; }
         [StructLayout(LayoutKind.Sequential)] internal struct POINT { public int X, Y; }
@@ -269,12 +338,13 @@ namespace Axon
             }
 
             SetDpiAwareness();
-            if (Environment.GetEnvironmentVariable("AXON_PRESENCE") != "off") Presence.Start();
-            Overlay.Start(Environment.GetEnvironmentVariable("AXON_OVERLAY") != "off");
+            if (Environment.GetEnvironmentVariable("CU_PRESENCE") != "off") Presence.Start();
+            Presence.OnPanic = delegate { Native.EndExclusive(); Overlay.RequestStop(); };
+            Overlay.Start(Environment.GetEnvironmentVariable("CU_OVERLAY") != "off");
             Configure(
-                EnvInt("AXON_IDLE_MS", 1200),
-                EnvInt("AXON_WAIT_MS", 6000),
-                Environment.GetEnvironmentVariable("AXON_MODE"));
+                EnvInt("CU_IDLE_MS", 1200),
+                EnvInt("CU_WAIT_MS", 6000),
+                Environment.GetEnvironmentVariable("CU_MODE"));
 
             _js = new JavaScriptSerializer();
             _js.MaxJsonLength = 64 * 1024 * 1024;
@@ -317,6 +387,7 @@ namespace Axon
                     {
                         Dictionary<string, object> bye = new Dictionary<string, object>();
                         bye["bye"] = true;
+                        Native.EndExclusive();
                         Respond(reqId, bye, 0);
                         return 0;
                     }
@@ -644,9 +715,9 @@ namespace Axon
 
             foreach (AutomationElement w in wins)
             {
-                // Axon's own windows are never user windows, so they are excluded
+                // Computer Use's own windows are never user windows, so they are excluded
                 // unconditionally - include_hidden reveals the user's minimized
-                // windows, not Axon's marker.
+                // windows, not Computer Use's marker.
                 if (IsSelfWindow(w)) continue;
                 if (!includeHidden && !IsRealWindow(w)) continue;
                 try
@@ -933,10 +1004,20 @@ namespace Axon
 
         static AutomationElement FindBySelector(Dictionary<string, object> a)
         {
-            AutomationElement win = RequireWindow(a);
+            // Validate the selector before resolving a window. A malformed
+            // selector is the caller's mistake either way, and reporting it as
+            // window_not_found because the window happened to close as well
+            // sends them looking in entirely the wrong place.
             Dictionary<string, object> sel = Get(a, "selector") as Dictionary<string, object>;
             if (sel == null)
                 throw new AxonError("bad_selector", "Selector must be an object.", null);
+            if (string.IsNullOrEmpty(Str(Get(sel, "automation_id")))
+                && string.IsNullOrEmpty(Str(Get(sel, "name")))
+                && string.IsNullOrEmpty(Str(Get(sel, "role"))))
+                throw new AxonError("bad_selector",
+                    "Selector needs at least one of automation_id, name, or role.", null);
+
+            AutomationElement win = RequireWindow(a);
 
             List<Condition> conds = new List<Condition>();
             string aid = Str(Get(sel, "automation_id"));
@@ -1020,9 +1101,9 @@ namespace Axon
 
         // ---- coexistence -------------------------------------------------------
         //
-        // Axon shares one desktop with a human. Reading a window never touches
+        // Computer Use shares one desktop with a human. Reading a window never touches
         // input, and neither does invoking an accessibility pattern, so most of
-        // what Axon does is genuinely invisible. Only two things intrude: moving
+        // what Computer Use does is genuinely invisible. Only two things intrude: moving
         // the cursor and taking the foreground. Those are what this gates.
 
         static int _idleMs = 1200;      // quiet for this long counts as "not using it"
@@ -1060,11 +1141,14 @@ namespace Axon
         {
             GuardStopped();
             Overlay.MarkActive();
-            if (ModeOf(a) == "take") return;
+            // take and exclusive both mean "go now". exclusive additionally
+            // holds the user off, so waiting for a gap would defeat its purpose.
+            string m0 = ModeOf(a);
+            if (m0 == "take" || m0 == "exclusive") return;
             if (!Presence.HooksOk || target == IntPtr.Zero) return;
             if (!Presence.Busy(_idleMs)) return;
             // Only their own window counts. Being busy elsewhere is exactly the
-            // case Axon is built for, and a window Axon itself just raised is
+            // case Computer Use is built for, and a window Computer Use itself just raised is
             // not one the user was working in.
             if (Hwnd(Presence.CommitWindow) != Hwnd(target)) return;
             if (Native.GetForegroundWindow() != target) return;
@@ -1080,7 +1164,7 @@ namespace Axon
             GuardStopped();
             Overlay.MarkActive();
             string mode = ModeOf(a);
-            if (mode == "take") return -1;
+            if (mode == "take" || mode == "exclusive") return -1;
             if (!Presence.Available) return -1;
             if (!Presence.Active(_idleMs)) return -1;
 
@@ -1110,6 +1194,7 @@ namespace Axon
             r["user_busy"] = Presence.Busy(_idleMs);
             r["idle_threshold_ms"] = _idleMs;
             r["stop_requested"] = Overlay.StopRequested;
+            r["input_blocked"] = Native.InputBlocked;
             r["mode"] = _mode;
             IntPtr fg = Native.GetForegroundWindow();
             r["foreground_hwnd"] = Hwnd(fg);
@@ -1134,7 +1219,7 @@ namespace Axon
 
         // ---- actions ----------------------------------------------------------
 
-        // Window handles reach Axon from two directions: as an int from
+        // Window handles reach Computer Use from two directions: as an int from
         // UIAutomation's NativeWindowHandle, and as an IntPtr from user32. On a
         // handle with the high bit set those sign-extend differently, so every
         // comparison goes through the same 32-bit normalisation.
@@ -1173,9 +1258,11 @@ namespace Axon
             return fallback;
         }
 
+        static bool Exclusive(Dictionary<string, object> a) { return ModeOf(a) == "exclusive"; }
+
         static void PhysicalClick(Dictionary<string, object> a, int[] point, string button, int clicks, IntPtr expectWindow, Dictionary<string, object> res)
         {
-            // This is one of only two things Axon does that the user can feel.
+            // This is one of only two things Computer Use does that the user can feel.
             NoteWait(res, GuardDisturb(a));
 
             // Borrow the pointer, then put it back where they left it.
@@ -1188,7 +1275,7 @@ namespace Axon
             if (expectWindow != IntPtr.Zero)
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
-                // Axon's own marker and banner never count as a window covering the target.
+                // Computer Use's own marker and banner never count as a window covering the target.
                 if (Overlay.IsOwnWindow(owner)) owner = expectWindow;
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
@@ -1201,15 +1288,21 @@ namespace Axon
                             "Move or close what is on top, or target an element that exposes an invoke pattern - those do not need the window to be visible.");
                 }
             }
-            Native.SetCursorPos(point[0], point[1]);
-            System.Threading.Thread.Sleep(16);
-            for (int n = 0; n < clicks; n++)
+            bool held = Exclusive(a) && Native.BeginExclusive();
+            try
             {
-                Native.MouseButton(button, true);
-                System.Threading.Thread.Sleep(12);
-                Native.MouseButton(button, false);
-                if (n < clicks - 1) System.Threading.Thread.Sleep(60);
+                Native.SetCursorPos(point[0], point[1]);
+                System.Threading.Thread.Sleep(16);
+                for (int n = 0; n < clicks; n++)
+                {
+                    Native.MouseButton(button, true);
+                    System.Threading.Thread.Sleep(12);
+                    Native.MouseButton(button, false);
+                    if (n < clicks - 1) System.Threading.Thread.Sleep(60);
+                }
             }
+            finally { if (held) Native.EndExclusive(); }
+            if (held) res["input_held"] = true;
             if (haveSaved && ModeOf(a) != "take")
             {
                 System.Threading.Thread.Sleep(20);
@@ -1294,7 +1387,19 @@ namespace Axon
         static void Trace(AutomationElement el, string label)
         {
             if (!Overlay.Enabled || el == null) return;
-            try { Overlay.Flash(RectOf(el), label); } catch { }
+            try
+            {
+                // Name the control, not just the verb. "click: Save" is
+                // readable from across the room; a bare rectangle is not.
+                string name = NameOf(el);
+                if (!string.IsNullOrEmpty(name))
+                {
+                    if (name.Length > 34) name = name.Substring(0, 34) + "...";
+                    label = label + ": " + name;
+                }
+                Overlay.Flash(RectOf(el), label);
+            }
+            catch { }
         }
 
         static object OpClick(Dictionary<string, object> a)
@@ -1461,7 +1566,10 @@ namespace Axon
                 // No element named, so this types into whatever holds focus.
                 RequireForeground(HwndArg(a), a, res);
             }
-            Native.TypeUnicode(text);
+            bool held = Exclusive(a) && Native.BeginExclusive();
+            try { Native.TypeUnicode(text); }
+            finally { if (held) Native.EndExclusive(); }
+            if (held) res["input_held"] = true;
             res["typed"] = text.Length;
             return res;
         }
@@ -1610,7 +1718,7 @@ namespace Axon
             }
             catch { throw new AxonError("window_gone", "The window disappeared while resolving it.", null); }
 
-            // WM_CLOSE to one specific window. Axon has no process-termination
+            // WM_CLOSE to one specific window. Computer Use has no process-termination
             // op at all: closing a window lets the app run its own save prompts,
             // where killing a process discards unsaved work without asking.
             Native.SendMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);

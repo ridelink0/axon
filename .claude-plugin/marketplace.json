@@ -1,33 +1,40 @@
 {
-  "name": "axon",
+  "name": "computer-use",
   "owner": {
     "name": "ridelink0",
     "url": "https://github.com/ridelink0"
   },
   "metadata": {
-    "description": "Semantic computer use for Windows",
+    "description": "Codex-style computer use for Claude Code",
     "version": "0.1.0"
   },
   "plugins": [
     {
-      "name": "axon",
+      "name": "computer-use",
       "source": "./",
-      "description": "Semantic computer use for Windows and macOS. Reads apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs ~23x fewer tokens. Knows the difference between your input and its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
+      "description": "Codex-style computer use for Claude Code. Drives Windows and macOS apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs about 20x fewer tokens. Knows your input from its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
       "version": "0.1.0",
       "author": {
         "name": "ridelink0",
         "url": "https://github.com/ridelink0"
       },
-      "homepage": "https://github.com/ridelink0/axon",
+      "homepage": "https://github.com/ridelink0/claude-computer-use",
       "license": "MIT",
       "keywords": [
+        "computer use",
         "computer-use",
-        "windows",
-        "ui-automation",
-        "accessibility",
-        "desktop-automation",
-        "gui",
-        "agent"
+        "codex computer use",
+        "codex",
+        "desktop automation",
+        "gui automation",
+        "windows automation",
+        "accessibility tree",
+        "ui automation",
+        "screen control",
+        "click",
+        "automate apps",
+        "desktop agent",
+        "macos automation"
       ]
     }
   ]
