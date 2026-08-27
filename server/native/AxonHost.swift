@@ -180,6 +180,11 @@ func axActions(_ el: AXUIElement) -> [String] {
 func axRect(_ el: AXUIElement) -> [Int]? {
     guard let posRaw = axAttr(el, kAXPositionAttribute as String),
           let sizeRaw = axAttr(el, kAXSizeAttribute as String) else { return nil }
+    // These attributes are normally AXValue, but a misbehaving provider can
+    // return something else. A force-cast there would crash the whole host and
+    // take the session down, so the type is checked before casting.
+    guard CFGetTypeID(posRaw) == AXValueGetTypeID(),
+          CFGetTypeID(sizeRaw) == AXValueGetTypeID() else { return nil }
     var origin = CGPoint.zero
     var size = CGSize.zero
     AXValueGetValue(posRaw as! AXValue, .cgPoint, &origin)
@@ -663,7 +668,8 @@ func opCloseWindow(_ a: [String: Any]) throws -> [String: Any] {
     let (win, _, title) = try resolveWindow(a)
     // Press the window's own close button, so the app can still offer to save.
     // Axon has no way to terminate a process, on either platform.
-    if let closeBtn = axAttr(win, kAXCloseButtonAttribute as String) {
+    if let closeBtn = axAttr(win, kAXCloseButtonAttribute as String),
+       CFGetTypeID(closeBtn) == AXUIElementGetTypeID() {
         AXUIElementPerformAction(closeBtn as! AXUIElement, "AXPress" as CFString)
     }
     Thread.sleep(forTimeInterval: 0.25)
