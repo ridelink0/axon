@@ -1409,8 +1409,16 @@ namespace Axon
             // the click lands is what the user expects - a brief flick, not a
             // relocation. Only skip when input is being held (exclusive), where
             // the user's pointer is frozen anyway and cannot be confused.
+            //
+            // The short settle is load-bearing: the mouse-up above is a queued
+            // SendInput event, while SetCursorPos moves the cursor immediately.
+            // Restoring with no gap can let the up register at the restored spot
+            // instead of the target - down here, up there - which the OS reads as
+            // a drag, and the click silently does not fire. A dozen milliseconds
+            // lets the button-up dispatch first; it is imperceptible.
             if (haveSaved && !held)
             {
+                System.Threading.Thread.Sleep(12);
                 Native.SetCursorPos(saved.X, saved.Y);
                 res["cursor_restored"] = true;
             }
@@ -1774,6 +1782,11 @@ namespace Axon
             bool horizontal = Bool(Get(a, "horizontal"), false);
             Dictionary<string, object> res = new Dictionary<string, object>();
             GuardSameWindow(a, HwndArg(a));
+            // Remember where the pointer was, so the wheel fallback can put it
+            // back. The scroll-pattern path never moves it, so this is unused
+            // there - saved but never restored, harmless.
+            Native.POINT scrollSaved;
+            bool scrollHaveSaved = Native.GetCursorPos(out scrollSaved);
 
             if (Get(a, "index") != null || Get(a, "selector") != null)
             {
@@ -1818,6 +1831,16 @@ namespace Axon
             Native.MouseWheel(amount * 120, horizontal);
             res["method"] = "wheel";
             res["delta"] = amount * 120;
+            // Put the pointer back where the user left it, the same courtesy the
+            // click path gives. The settle lets the queued wheel dispatch at the
+            // target before the cursor moves off it. Exclusive holds input, so
+            // there is no user pointer to confuse.
+            if (scrollHaveSaved && ModeOf(a) != "exclusive")
+            {
+                System.Threading.Thread.Sleep(12);
+                Native.SetCursorPos(scrollSaved.X, scrollSaved.Y);
+                res["cursor_restored"] = true;
+            }
             return res;
         }
 
