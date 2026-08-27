@@ -380,6 +380,19 @@ const handlers = {
       if (!win) return fail('window_not_found', 'No window matched.', 'Call computer_apps for current handles.');
       const check = policy.checkRead(win);
       if (!check.ok) return failCheck(check);
+    } else {
+      // A full-screen capture grabs whatever is on screen - which could be a
+      // credential, elevation, or login surface that the blocked tier promises
+      // is never readable. The tree refuses those; a whole-screen screenshot
+      // must not be a way around that. Refuse while one is visible; a
+      // window-scoped screenshot of something else is still fine.
+      const vis = await listWindows({ fresh: true });
+      const exposed = vis.find((w) => !w.minimized && !policy.isSelf(w) && classify(w).tier === TIER.BLOCKED);
+      if (exposed) {
+        return fail('blocked_on_screen',
+          `A credential or security window ("${exposed.process || exposed.title}") is on screen, so a full-screen capture is refused - it would expose what the blocked tier is meant to protect.`,
+          'Screenshot a specific window with hwnd instead, or close that window first.');
+      }
     }
     const { result } = await driver.call('screenshot', {
       hwnd: win ? Number(win.hwnd) : undefined,
