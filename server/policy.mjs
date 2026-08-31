@@ -130,6 +130,44 @@ export function classify(win) {
   return { tier: TIER.STANDARD, reason: null };
 }
 
+
+// Controls whose own label says the click leaves this machine or cannot be
+// taken back: money moves, a message is sent, something is destroyed. OpenAI's
+// agent stops and asks the person before exactly these, and that is the right
+// behaviour for an agent holding someone's real accounts.
+//
+// Word boundaries throughout, so "Resend later" and "Deleted Items" are not
+// caught by "send" and "delete". The list is deliberately about the point of no
+// return, not about caution in general: a gate that fires on "Save" would teach
+// everyone to ignore it. Bare "Submit" is out for the same reason - too many
+// harmless forms - while "Submit payment" is in.
+const CONSEQUENTIAL = new RegExp([
+  // money
+  String.raw`\b(buy|purchase|pay|place\s+(the\s+)?order|order\s+now|checkout|check\s+out`,
+  String.raw`|complete\s+(order|purchase|booking)|confirm\s+(order|payment|purchase|booking|ride|trip)`,
+  String.raw`|book\s+(now|ride|trip|flight|hotel)|request\s+(ride|trip|pickup)`,
+  String.raw`|subscribe|donate|transfer|withdraw)\b`,
+  // things that leave the machine
+  String.raw`|\b(send|reply\s+all|post|publish|tweet|invite|submit\s+(order|payment|application|form))\b`,
+  // things that do not come back
+  String.raw`|\b(delete|permanently\s+delete|empty\s+trash|empty\s+bin|erase|wipe|uninstall|revoke)\b`,
+].join(''), 'i');
+
+// True when a control's name says pressing it has consequences the user should
+// have been asked about first.
+export function isConsequential(name) {
+  if (!name) return false;
+  return CONSEQUENTIAL.test(String(name));
+}
+
+// Do two window rectangles share any pixels? Unknown geometry counts as
+// overlapping: a capture is refused on the safe side, never allowed on a guess.
+export function rectsOverlap(a, b) {
+  if (!a || !b) return true;
+  return a[0] < b[0] + b[2] && b[0] < a[0] + a[2]
+      && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+}
+
 export class Policy {
   constructor() {
     // key: normalised process name -> { grantedAt, reason }
@@ -182,6 +220,21 @@ export class Policy {
     const out = [];
     for (const [k, v] of this.grants) out.push({ app: k, tier: v.tier, granted_at: new Date(v.grantedAt).toISOString() });
     return out;
+  }
+
+  // Pixels do not respect tiers. A capture shows whatever is drawn in the
+  // region, so a password manager sitting over the target window would be
+  // photographed even though its own tree is unreadable. Pass the target window
+  // for a window-scoped capture, or null for the whole screen.
+  blockedInFrame(windows, target) {
+    for (const w of windows || []) {
+      if (w.minimized || this.isSelf(w)) continue;
+      if (classify(w).tier !== TIER.BLOCKED) continue;
+      if (!target) return w;
+      if (Number(w.hwnd) === Number(target.hwnd)) continue;
+      if (rectsOverlap(w.rect, target.rect)) return w;
+    }
+    return null;
   }
 
   // Gate for read operations: snapshot, screenshot of a window.

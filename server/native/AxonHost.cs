@@ -36,6 +36,9 @@ namespace Axon
         [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] internal static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumChildProc cb, IntPtr lparam);
+        [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumChildProc cb, IntPtr lparam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder text, int max);
+        [DllImport("user32.dll")] internal static extern int GetWindowLongW(IntPtr h, int index);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetClassName(IntPtr h, System.Text.StringBuilder cls, int max);
         [DllImport("user32.dll")] internal static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
         internal delegate bool EnumChildProc(IntPtr h, IntPtr lparam);
@@ -309,6 +312,9 @@ namespace Axon
         static int _snapSeq = 0;
         const int MaxSnapshots = 8;
         static string _dpiMode = "none";
+        // True while an operation is in flight, so Escape can tell "stop this"
+        // from "the user pressed Escape in their own app".
+        static volatile bool _busy;
         static readonly int _selfPid = System.Diagnostics.Process.GetCurrentProcess().Id;
         static JavaScriptSerializer _js;
 
@@ -343,7 +349,21 @@ namespace Axon
 
             SetDpiAwareness();
             if (Environment.GetEnvironmentVariable("CU_PRESENCE") != "off") Presence.Start();
-            Presence.OnPanic = delegate { Native.EndExclusive(); Overlay.RequestStop(); };
+            // Escape means "stop what you are doing to my machine". It only
+            // means that while Computer Use is actually doing something -
+            // otherwise every Escape the user presses in their own apps would
+            // arm a stop that fails Claude's next action minutes later, and
+            // withdraws every grant with it. Releasing any input hold is
+            // unconditional, because that is never the wrong thing to do.
+            Presence.OnPanic = delegate
+            {
+                Native.EndExclusive();
+                if (_busy || Overlay.ActiveWithin(3000)) Overlay.RequestStop();
+            };
+            Overlay.Configure(
+                EnvInt("CU_SESSION_SLOT", 0),
+                Environment.GetEnvironmentVariable("CU_SESSION_LABEL"),
+                0);
             Overlay.Start(Environment.GetEnvironmentVariable("CU_OVERLAY") != "off");
             Configure(
                 EnvInt("CU_IDLE_MS", 1200),
@@ -367,6 +387,9 @@ namespace Axon
             ready["clr"] = Environment.Version.ToString();
             ready["presence"] = Presence.HooksOk;
             ready["overlay"] = Overlay.Enabled;
+            // Which colour this session's cursor, marker and banner are drawn
+            // in. One Claude is always Claude's own colour; a second is not.
+            ready["accent"] = Overlay.AccentHex;
             WriteLine(ready);
 
             while (true)
@@ -397,8 +420,10 @@ namespace Axon
                     }
 
                     System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
-                    object result = Dispatch(op, a);
-                    sw.Stop();
+                    object result;
+                    _busy = true;
+                    try { result = Dispatch(op, a); }
+                    finally { _busy = false; sw.Stop(); }
                     Respond(reqId, result, sw.ElapsedMilliseconds);
                 }
                 catch (AxonError ax)
@@ -432,6 +457,7 @@ namespace Axon
             {
                 case "ping": return OpPing();
                 case "presence": return OpPresence(a);
+                case "session": return OpSession(a);
                 case "list_apps": return OpListApps(a);
                 case "snapshot": return OpSnapshot(a);
                 case "click": return OpClick(a);
@@ -682,7 +708,10 @@ namespace Axon
             {
                 if (el.Current.ProcessId == _selfPid) return true;
                 IntPtr h = new IntPtr(el.Current.NativeWindowHandle);
-                return Overlay.IsOwnWindow(h);
+                // Another Claude session's banner and marker are Computer Use's
+                // own chrome too. Listing them would offer Claude its own UI as
+                // something to click.
+                return Overlay.IsAnyOverlayWindow(h);
             }
             catch { return false; }
         }
@@ -697,7 +726,7 @@ namespace Axon
                 if (!Native.IsWindow(h)) return false;
                 if (!Native.IsWindowVisible(h)) return false;
                 if (Native.IsCloaked(h)) return false;
-                if (Overlay.IsOwnWindow(h)) return false;
+                if (Overlay.IsAnyOverlayWindow(h)) return false;
                 foreach (string s in ShellClasses) if (s == c.ClassName) return false;
                 int[] r = RectOf(el);
                 if (r == null) return false;
@@ -715,6 +744,7 @@ namespace Axon
             AutomationElement root = AutomationElement.RootElement;
             AutomationElementCollection wins = root.FindAll(TreeScope.Children, Condition.TrueCondition);
             List<object> list = new List<object>();
+            Dictionary<long, bool> seen = new Dictionary<long, bool>();
             IntPtr fg = Native.GetForegroundWindow();
 
             foreach (AutomationElement w in wins)
@@ -739,8 +769,84 @@ namespace Axon
                     e["path"] = ppath;
                     e["rect"] = RectOf(w);
                     e["minimized"] = Native.IsIconic(h);
+                    // A window on another virtual desktop is cloaked, and so are
+                    // some suspended apps - only ask the desktop manager about
+                    // the cloaked ones, and only then is the answer interesting.
+                    // It matters because a pattern click still works on such a
+                    // window while a real click would land on whatever occupies
+                    // those coordinates on the desktop the user is looking at.
+                    if (Native.IsCloaked(h) && Overlay.OnCurrentDesktop(h) == 0) e["other_desktop"] = true;
                     e["foreground"] = (h == fg);
+                    seen[Hwnd(h)] = true;
                     list.Add(e);
+                }
+                catch { }
+            }
+
+            // Windows the desktop walk cannot see. UIA enumerates the desktop the
+            // user is looking at, so everything on another virtual desktop is
+            // missing from it entirely - not hidden, absent. Those windows are
+            // still perfectly readable and drivable through their patterns, so
+            // when the caller has asked to see everything, they are found the
+            // way the operating system finds them and added.
+            if (includeHidden)
+            {
+                try
+                {
+                    Native.EnumWindows(delegate(IntPtr h, IntPtr lp)
+                    {
+                        try
+                        {
+                            long key = Hwnd(h);
+                            if (seen.ContainsKey(key)) return true;
+                            if (!Native.IsWindow(h)) return true;
+                            // Cloaking is what marks these: on another desktop, or
+                            // a suspended app. An ordinary hidden window is not
+                            // interesting and there are hundreds of them.
+                            if (!Native.IsCloaked(h)) return true;
+                            if (Overlay.IsAnyOverlayWindow(h)) return true;
+                            // Tool windows and untitled shells are furniture.
+                            if ((Native.GetWindowLongW(h, -20) & 0x00000080) != 0) return true;   // WS_EX_TOOLWINDOW
+
+                            System.Text.StringBuilder sb = new System.Text.StringBuilder(512);
+                            Native.GetWindowTextW(h, sb, sb.Capacity);
+                            string title = sb.ToString();
+                            if (title.Length == 0) return true;
+
+                            Native.RECT rr;
+                            if (!Native.GetWindowRect(h, out rr)) return true;
+                            int rw = rr.Right - rr.Left, rh = rr.Bottom - rr.Top;
+                            if (rw < 40 || rh < 40) return true;
+
+                            uint wpid;
+                            Native.GetWindowThreadProcessId(h, out wpid);
+                            if ((int)wpid == _selfPid) return true;
+
+                            System.Text.StringBuilder cb2 = new System.Text.StringBuilder(128);
+                            Native.GetClassName(h, cb2, cb2.Capacity);
+                            string cls = cb2.ToString();
+                            foreach (string sh in ShellClasses) if (sh == cls) return true;
+
+                            string pname, ppath;
+                            ProcessInfo((int)wpid, out pname, out ppath);
+
+                            Dictionary<string, object> e2 = new Dictionary<string, object>();
+                            e2["hwnd"] = key;
+                            e2["title"] = title;
+                            e2["class"] = cls;
+                            e2["pid"] = (int)wpid;
+                            e2["process"] = pname;
+                            e2["path"] = ppath;
+                            e2["rect"] = new int[] { rr.Left, rr.Top, rw, rh };
+                            e2["minimized"] = Native.IsIconic(h);
+                            e2["foreground"] = false;
+                            if (Overlay.OnCurrentDesktop(h) == 0) e2["other_desktop"] = true;
+                            seen[key] = true;
+                            list.Add(e2);
+                        }
+                        catch { }
+                        return true;
+                    }, IntPtr.Zero);
                 }
                 catch { }
             }
@@ -784,6 +890,20 @@ namespace Axon
                 foreach (AutomationElement w in wins)
                 {
                     try { if ((long)w.Current.NativeWindowHandle == want) return w; }
+                    catch { }
+                }
+                // The desktop walk does not include windows on other virtual
+                // desktops - switch desktops and a window Claude was working on
+                // simply stops existing as far as that scan is concerned. A
+                // handle is an explicit request for one particular window, and
+                // it resolves whether or not the user is looking at it.
+                if (want != 0)
+                {
+                    try
+                    {
+                        AutomationElement direct = AutomationElement.FromHandle(new IntPtr(want));
+                        if (direct != null) return direct;
+                    }
                     catch { }
                 }
                 return null;
@@ -923,10 +1043,35 @@ namespace Axon
                 catch { }
             }
 
+            // A window on another virtual desktop is not being drawn anywhere, so
+            // every element in it reports an empty rectangle. Dropping rect-less
+            // elements is right for a window on screen - they are the invisible
+            // scaffolding - and completely wrong here, where it would throw away
+            // the entire contents of a window that reads and drives perfectly
+            // well through its patterns.
+            bool offDesktop = false;
+            try
+            {
+                IntPtr wh = new IntPtr(win.Current.NativeWindowHandle);
+                offDesktop = Overlay.OnCurrentDesktop(wh) == 0;
+            }
+            catch { }
+
             TreeWalker walker = TreeWalker.ControlViewWalker;
             List<AutomationElement> elements = new List<AutomationElement>();
             List<object> nodes = new List<object>();
             bool truncated = false;
+
+            // A node cap bounds the SIZE of a tree, not the TIME it takes to read
+            // one. An Electron window's provider can spend tens of milliseconds
+            // per node, and a thousand of those runs past the caller's timeout -
+            // at which point the host is still walking, the call has already
+            // failed, and the session is wedged for the rest of it. So the walk
+            // has a wall clock too: a partial tree that arrives beats a perfect
+            // one that does not.
+            System.Diagnostics.Stopwatch walkClock = System.Diagnostics.Stopwatch.StartNew();
+            int walkBudgetMs = EnvInt("CU_SNAPSHOT_MS", 8000);
+            bool ranOutOfTime = false;
 
             // Iterative walk keeps ordering stable and cannot blow the stack on
             // a deep tree such as browser content.
@@ -936,6 +1081,12 @@ namespace Axon
             while (stack.Count > 0)
             {
                 if (nodes.Count >= maxNodes) { truncated = true; break; }
+                if (walkClock.ElapsedMilliseconds > walkBudgetMs)
+                {
+                    truncated = true;
+                    ranOutOfTime = true;
+                    break;
+                }
                 Frame f = stack.Pop();
                 AutomationElement el = f.El;
 
@@ -946,7 +1097,7 @@ namespace Axon
 
                 bool include = true;
                 if (interactiveOnly && f.Depth > 0 && !interactive) include = false;
-                if (rect == null && f.Depth > 0) include = false;
+                if (rect == null && f.Depth > 0 && !offDesktop) include = false;
 
                 if (include)
                 {
@@ -1020,7 +1171,9 @@ namespace Axon
             res["rect"] = RectOf(win);
             res["node_count"] = nodes.Count;
             res["truncated"] = truncated;
+            if (ranOutOfTime) res["time_budget_ms"] = walkBudgetMs;
             if (web) res["web_accessibility_enabled"] = true;
+            if (offDesktop) res["other_desktop"] = true;
             res["nodes"] = nodes;
             return res;
         }
@@ -1204,14 +1357,25 @@ namespace Axon
         {
             if (idleMs > 0) _idleMs = idleMs;
             if (waitMs >= 0) _waitMs = waitMs;
-            if (!string.IsNullOrEmpty(mode)) _mode = mode;
+            string nm = NormMode(mode);
+            if (nm != null) _mode = nm;
+        }
+
+        // A plugin setting the user never filled in can arrive as the literal
+        // "${user_config.coexist_mode}", and a typo'd mode would otherwise be
+        // stored and reported as if it meant something. Unknown means default.
+        static string NormMode(string m)
+        {
+            if (string.IsNullOrEmpty(m)) return null;
+            string t = m.Trim().ToLowerInvariant();
+            if (t == "share" || t == "yield" || t == "take" || t == "exclusive") return t;
+            return null;
         }
 
         static string ModeOf(Dictionary<string, object> a)
         {
-            string m = Str(Get(a, "mode"));
-            if (string.IsNullOrEmpty(m)) return _mode;
-            return m;
+            string m = NormMode(Str(Get(a, "mode")));
+            return m != null ? m : _mode;
         }
 
         // Cheap gate on every action: never contend for the window the human is
@@ -1277,6 +1441,21 @@ namespace Axon
             if (waited > 0) res["waited_for_user_ms"] = waited;
         }
 
+        // How many other Claude sessions are live right now. The MCP layer owns
+        // that count - it is the one that reads the session registry - and pushes
+        // it here so the banner can name itself only while it needs to.
+        static object OpSession(Dictionary<string, object> a)
+        {
+            Overlay.Configure(
+                Int(Get(a, "slot"), 0),
+                Str(Get(a, "label")),
+                Int(Get(a, "peers"), 0));
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            res["ok"] = true;
+            res["accent"] = Overlay.AccentHex;
+            return res;
+        }
+
         static object OpPresence(Dictionary<string, object> a)
         {
             Dictionary<string, object> r = Presence.Report();
@@ -1286,6 +1465,18 @@ namespace Axon
             r["stop_requested"] = Overlay.StopRequested;
             r["input_blocked"] = Native.InputBlocked;
             r["mode"] = _mode;
+            // Whether this Windows can answer "is that window on the desktop the
+            // user is looking at". Reported rather than assumed, because the
+            // answer changes what a physical click means.
+            IntPtr fgProbe = Native.GetForegroundWindow();
+            r["virtual_desktops"] = (fgProbe != IntPtr.Zero && Overlay.OnCurrentDesktop(fgProbe) >= 0)
+                ? "available" : "unavailable";
+            int here = Overlay.OverlayHere();
+            if (here >= 0) r["overlay_on_current_desktop"] = here == 1;
+            // Injected events are anything synthetic - this session's input AND
+            // any other Claude session's. Never the user's, which is the property
+            // that matters, but worth being exact about.
+            r["injected_note"] = "injected events are synthetic input from any automation on this desktop, including other Claude sessions";
             IntPtr fg = Native.GetForegroundWindow();
             r["foreground_hwnd"] = Hwnd(fg);
             try
@@ -1340,6 +1531,59 @@ namespace Axon
                     "Another app is holding the foreground, often a modal dialog. Resolve that first.");
         }
 
+        // Keystrokes follow the keyboard focus, not a window we name. If focusing
+        // the target element did not actually take - a provider that refuses, an
+        // element that is not focusable, a window that would not come forward -
+        // then typing anyway puts the text into whatever the user has in front:
+        // their document, their chat, their terminal. That is the one failure
+        // that is worse than doing nothing, so it is checked rather than assumed.
+        static void RequireTypingFocus(AutomationElement el, IntPtr expect)
+        {
+            try { if (el != null && el.Current.HasKeyboardFocus) return; }
+            catch { }
+
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero)
+            {
+                IntPtr fgRoot = Native.GetAncestor(fg, 2 /* GA_ROOT */);
+                if (fgRoot == IntPtr.Zero) fgRoot = fg;
+
+                IntPtr want = expect;
+                // No window was named, so find the element's own top-level window.
+                if (want == IntPtr.Zero) want = TopWindowOf(el);
+                if (want != IntPtr.Zero)
+                {
+                    IntPtr wantRoot = Native.GetAncestor(want, 2);
+                    if (wantRoot == IntPtr.Zero) wantRoot = want;
+                    // The right window is in front. The element may simply not
+                    // report focus honestly, which many providers do not.
+                    if (fgRoot == wantRoot) return;
+                }
+            }
+
+            throw new AxonError("focus_failed",
+                "Could not put the keyboard focus on that element, so the text would have gone to whatever window is in front instead.",
+                "Use replace:true, which writes through the element's value pattern and needs no focus at all, or focus the window first.");
+        }
+
+        // Nearest ancestor with a real window handle. Child elements report zero.
+        static IntPtr TopWindowOf(AutomationElement el)
+        {
+            try
+            {
+                TreeWalker w = TreeWalker.ControlViewWalker;
+                AutomationElement cur = el;
+                for (int i = 0; i < 24 && cur != null; i++)
+                {
+                    int h = cur.Current.NativeWindowHandle;
+                    if (h != 0) return new IntPtr(h);
+                    cur = w.GetParent(cur);
+                }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
         static int EnvInt(string name, int fallback)
         {
             string v = Environment.GetEnvironmentVariable(name);
@@ -1365,8 +1609,13 @@ namespace Axon
             if (expectWindow != IntPtr.Zero)
             {
                 IntPtr owner = Native.RootWindowAt(point[0], point[1]);
-                // Computer Use's own marker and banner never count as a cover.
+                // Our own chrome is not a cover: the marker, ring and cursor are
+                // click-through already, and the banner steps aside below.
                 if (Overlay.IsOwnWindow(owner)) owner = expectWindow;
+                else if (Overlay.IsAnyOverlayWindow(owner))
+                    throw new AxonError("obscured",
+                        "Another Claude session's on-screen banner is over that control, so a real click would press their banner instead.",
+                        "Target it by index or selector - the pattern path clicks it where it sits, with nothing in the way.");
                 if (owner != IntPtr.Zero && owner != expectWindow)
                 {
                     // Only take/exclusive may raise a covered window - those are
@@ -1389,6 +1638,9 @@ namespace Axon
                 }
             }
             bool held = Exclusive(a) && Native.BeginExclusive();
+            // The banner accepts clicks, so it would swallow one aimed at a
+            // control underneath it - or worse, press its own Stop button.
+            bool steppedAside = Overlay.BeginClickThrough(point[0], point[1]);
             try
             {
                 Native.SetCursorPos(point[0], point[1]);
@@ -1401,8 +1653,13 @@ namespace Axon
                     if (n < clicks - 1) System.Threading.Thread.Sleep(60);
                 }
             }
-            finally { if (held) Native.EndExclusive(); }
+            finally
+            {
+                if (held) Native.EndExclusive();
+                if (steppedAside) Overlay.EndClickThrough();
+            }
             if (held) res["input_held"] = true;
+            if (steppedAside) res["banner_stepped_aside"] = true;
             // Always put the pointer back. The click is the action; leaving the
             // cursor parked on the control just makes the user's own pointer
             // appear to jump away. Even in take mode, snapping it back the moment
@@ -1539,7 +1796,7 @@ namespace Axon
                 int cx = r[0] + r[2] / 2;
                 int cy = r[1] + r[3] / 2;
                 IntPtr onTop = Native.RootWindowAt(cx, cy);
-                if (onTop == IntPtr.Zero || Overlay.IsOwnWindow(onTop)) return false;
+                if (onTop == IntPtr.Zero || Overlay.IsAnyOverlayWindow(onTop)) return false;
 
                 IntPtr expRoot = Native.GetAncestor(expectWindow, 2 /* GA_ROOT */);
                 if (expRoot == IntPtr.Zero) expRoot = expectWindow;
@@ -1634,8 +1891,21 @@ namespace Axon
 
             try { el.SetFocus(); } catch { }
             Trace(el, "click", HwndArg(a));
-            int[] point = ClickPointOf(el);
-            PhysicalClick(a, point, button, clicks, HwndArg(a), res);
+
+            // Get our own banner out of the way before working out where to
+            // click, not after: while it covers part of a control, the provider
+            // reports a clickable point on whatever sliver is still showing,
+            // which lands on the control's edge and can miss it altogether.
+            int[] box = RectOf(el);
+            bool aside = box != null && Overlay.BeginClickThroughRect(box[0], box[1], box[2], box[3]);
+            int[] point;
+            try
+            {
+                point = ClickPointOf(el);
+                PhysicalClick(a, point, button, clicks, HwndArg(a), res);
+            }
+            finally { if (aside) Overlay.EndClickThrough(); }
+            if (aside) res["banner_stepped_aside"] = true;
             res["method"] = "physical";
             res["point"] = point;
             System.Threading.Thread.Sleep(60);
@@ -1667,12 +1937,36 @@ namespace Axon
                         throw new AxonError("readonly", "That field is read-only.", null);
                     try
                     {
+                        // A contenteditable - a web composer, a rich text box -
+                        // can expose the value pattern and then quietly ignore
+                        // the setter: no exception, no change. Reporting that as
+                        // "set field via value_pattern" is the worst kind of
+                        // wrong, because the caller goes on believing the text
+                        // is there. So the write is read back and checked.
+                        string before = null;
+                        try { before = vp.Current.Value; } catch { }
                         Trace(el, "type", HwndArg(a));
                         vp.SetValue(text);
-                        res["method"] = "value_pattern";
-                        res["value"] = vp.Current.Value;
-                        AddNowState(res, el);
-                        return res;
+                        string after = null;
+                        try { after = vp.Current.Value; } catch { }
+
+                        bool exact = after == text;
+                        // Some providers normalise what they store - a date, a
+                        // phone mask, a trimmed string - so a changed value that
+                        // is not character-for-character what we asked for still
+                        // counts as taken. Only a value that did not move at all
+                        // means the setter was ignored.
+                        bool moved = after != before;
+                        if (exact || moved)
+                        {
+                            res["method"] = "value_pattern";
+                            res["value"] = after;
+                            if (!exact) res["normalised_by_app"] = true;
+                            AddNowState(res, el);
+                            return res;
+                        }
+                        // Ignored. Fall through and type it for real.
+                        res["value_pattern_ignored"] = true;
                     }
                     catch { /* fall through to typing */ }
                 }
@@ -1684,10 +1978,20 @@ namespace Axon
             try { el.SetFocus(); }
             catch
             {
-                throw new AxonError("focus_failed", "Could not focus that element to type into it.",
-                    "Call focus on the window first.");
+                // "Focus the window first" is the wrong advice here and sends the
+                // caller round a loop that cannot work: the window is already in
+                // front, and this control refuses the focus itself. Browsers are
+                // the common case - the outer "Address bar" is a container that
+                // takes neither a value nor the focus, while the "Address field"
+                // inside it takes both.
+                throw new AxonError("focus_failed",
+                    "That control refused both a programmatic value and the keyboard focus, so nothing was typed.",
+                    "Do not retry this element or re-focus the window - neither will help. Either target the real editable field inside it "
+                    + "(in a browser that is \"Address field\", not \"Address bar\"), or focus the field with its own shortcut - ctrl+l for a browser "
+                    + "address bar - and then use computer_type with no target and no replace, which types wherever the keyboard focus actually is.");
             }
             System.Threading.Thread.Sleep(40);
+            RequireTypingFocus(el, HwndArg(a));
             Native.KeyDown(0x11); Native.KeyTap(0x41); Native.KeyUp(0x11); // ctrl+a
             System.Threading.Thread.Sleep(20);
             Native.TypeUnicode(text);
@@ -1704,8 +2008,14 @@ namespace Axon
             if (Get(a, "index") != null || Get(a, "selector") != null)
             {
                 Target t = ResolveTarget(a);
+                IntPtr want = HwndArg(a);
+                // Focusing an element in a window that is not in front raises that
+                // window, which the user feels, so it goes through the same gate
+                // as any other foreground change.
+                if (want != IntPtr.Zero && Native.GetForegroundWindow() != want) NoteWait(res, GuardDisturb(a));
                 try { t.El.SetFocus(); } catch { }
                 System.Threading.Thread.Sleep(40);
+                RequireTypingFocus(t.El, want);
             }
             else
             {
@@ -1782,12 +2092,8 @@ namespace Axon
             bool horizontal = Bool(Get(a, "horizontal"), false);
             Dictionary<string, object> res = new Dictionary<string, object>();
             GuardSameWindow(a, HwndArg(a));
-            // Remember where the pointer was, so the wheel fallback can put it
-            // back. The scroll-pattern path never moves it, so this is unused
-            // there - saved but never restored, harmless.
-            Native.POINT scrollSaved;
-            bool scrollHaveSaved = Native.GetCursorPos(out scrollSaved);
 
+            int[] wheelPoint = null;
             if (Get(a, "index") != null || Get(a, "selector") != null)
             {
                 Target t = ResolveTarget(a);
@@ -1812,22 +2118,32 @@ namespace Axon
                     }
                     catch { }
                 }
-                try
-                {
-                    int[] pt = ClickPointOf(el);
-                    Native.SetCursorPos(pt[0], pt[1]);
-                }
+                try { wheelPoint = ClickPointOf(el); }
                 catch { }
             }
             else
             {
                 object pt = Get(a, "point");
                 object[] arr = pt as object[];
-                if (arr != null && arr.Length >= 2) Native.SetCursorPos(Int(arr[0], 0), Int(arr[1], 0));
+                if (arr != null && arr.Length >= 2) wheelPoint = new int[] { Int(arr[0], 0), Int(arr[1], 0) };
             }
 
+            // The gate comes before the pointer moves. Moving it first and asking
+            // afterwards means a yield-mode refusal has already yanked the user's
+            // cursor onto the target and left it there.
             NoteWait(res, GuardDisturb(a));
-            System.Threading.Thread.Sleep(16);
+
+            // Where the pointer is NOW - after any wait for the user to pause.
+            // Reading it before the wait would restore it to where their cursor
+            // was seconds ago, which moves it for them rather than putting it back.
+            Native.POINT scrollSaved;
+            bool scrollHaveSaved = Native.GetCursorPos(out scrollSaved);
+
+            if (wheelPoint != null)
+            {
+                Native.SetCursorPos(wheelPoint[0], wheelPoint[1]);
+                System.Threading.Thread.Sleep(16);
+            }
             Native.MouseWheel(amount * 120, horizontal);
             res["method"] = "wheel";
             res["delta"] = amount * 120;
@@ -1869,6 +2185,8 @@ namespace Axon
 
         static object OpCloseWindow(Dictionary<string, object> a)
         {
+            GuardStopped();
+            Overlay.MarkActive();
             AutomationElement win = RequireWindow(a);
             IntPtr h;
             string title;

@@ -2,7 +2,7 @@
 // and grant logic against synthetic window records, so every tier and every
 // refusal path is covered deterministically.
 
-import { Policy, classify, TIER } from '../server/policy.mjs';
+import { Policy, classify, isConsequential, TIER } from '../server/policy.mjs';
 
 let pass = 0, fail = 0; const failures = [];
 const check = (n, c, d) => {
@@ -96,6 +96,68 @@ console.log('\n-- revokeAll --');
   p.grant(win('a')); p.grant(win('b')); p.grant(win('c'));
   check('revokeAll reports the count', p.revokeAll() === 3);
   check('nothing is granted afterwards', p.listGrants().length === 0);
+}
+
+console.log('\n-- the point of no return is asked about first --');
+{
+  // Both directions matter. Missing a real one lets Claude spend someone's
+  // money on a guess; firing on an ordinary control teaches everyone to wave
+  // the gate through, which is worse than not having it.
+  const asks = [
+    'Send', 'Send Payment', 'Send message', 'Reply all',
+    'Place order', 'Place the order', 'Order now', 'Buy now', 'Buy', 'Purchase',
+    'Pay', 'Pay $42.10', 'Checkout', 'Check out', 'Complete purchase',
+    'Confirm order', 'Confirm payment', 'Book ride', 'Book now', 'Request ride',
+    'Subscribe', 'Donate', 'Transfer', 'Withdraw', 'Submit payment',
+    'Delete', 'Delete this file', 'Permanently delete', 'Empty Trash',
+    'Erase', 'Uninstall', 'Revoke', 'Publish', 'Post', 'Tweet', 'Invite',
+  ];
+  const doesNot = [
+    'Press Me', 'Save', 'Save as', 'Cancel', 'OK', 'Close', 'Open', 'Next',
+    'Back', 'Search', 'Settings', 'Refresh', 'Copy', 'Paste', 'Select all',
+    'Preview', 'Print', 'Zoom in', 'New folder', 'Sign in', 'Compose', 'Reply',
+    'Draft', 'Bold', 'Format Painter', 'Formatting', 'Sender', 'Resend later',
+    'Deleted Items', 'Undelete', 'Postcode', 'Payment methods', 'Reposition',
+    'Submit', 'Bookmark', 'Booking history', 'Transferable',
+  ];
+  const missed = asks.filter((n) => !isConsequential(n));
+  const wrong = doesNot.filter((n) => isConsequential(n));
+  check(`all ${asks.length} point-of-no-return labels are caught`, missed.length === 0, missed.join(', '));
+  check(`none of ${doesNot.length} ordinary labels are`, wrong.length === 0, wrong.join(', '));
+  check('an unnamed control cannot be judged, so it is not gated', isConsequential(null) === false);
+  check('matching ignores case', isConsequential('SEND') && isConsequential('delete'));
+}
+
+console.log('\n-- a blocked window in frame stops the camera too --');
+{
+  const p = new Policy();
+  const at = (hwnd, process, rect, extra = {}) => ({ ...win(process, extra), hwnd, rect });
+  const target = at(1, 'notepad', [0, 0, 400, 400]);
+  const vault = at(2, 'keepass', [300, 300, 400, 400]);       // corner overlaps
+  const elsewhere = at(3, 'keepass', [1000, 1000, 200, 200]); // nowhere near
+
+  check('nothing blocked in frame is nothing to report',
+    p.blockedInFrame([target], target) === null);
+  check('a full-screen capture is refused while any blocked window is up',
+    p.blockedInFrame([target, elsewhere], null) === elsewhere);
+  check('a window capture is refused when a blocked window covers part of it',
+    p.blockedInFrame([target, vault], target) === vault);
+  check('a blocked window nowhere near the target does not block that capture',
+    p.blockedInFrame([target, elsewhere], target) === null);
+  check('a minimized blocked window is not in frame',
+    p.blockedInFrame([target, { ...vault, minimized: true }], target) === null);
+  check('a window with unknown geometry is treated as covering, not as clear',
+    p.blockedInFrame([target, { ...vault, rect: null }], target) !== null);
+  check('the target never blocks itself',
+    p.blockedInFrame([target], { ...target }) === null);
+
+  const p2 = new Policy();
+  p2.markSelf([99]);
+  check('our own session window is never the blocker',
+    p2.blockedInFrame([target, { ...vault, pid: 99 }], target) === null);
+
+  check('exact edge contact is not an overlap',
+    p.blockedInFrame([target, at(4, 'keepass', [400, 0, 100, 100])], target) === null);
 }
 
 console.log('\n-- case and extension are normalised --');

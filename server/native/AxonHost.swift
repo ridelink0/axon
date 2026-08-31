@@ -547,7 +547,16 @@ func opType(_ a: [String: Any]) throws -> [String: Any] {
     if a["index"] != nil || a["selector"] != nil {
         let (el, pid) = try resolveTarget(a)
         try guardSameWindow(a, pid)
-        AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, true as CFTypeRef)
+        let setErr = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, true as CFTypeRef)
+        // Keystrokes follow the keyboard focus, not the element we named. If
+        // focusing it did not take, typing anyway would put the text into
+        // whatever the user has in front - the one failure worse than nothing.
+        let landed = (axAttr(el, kAXFocusedAttribute as String) as? Bool) ?? false
+        if setErr != .success && !landed {
+            throw AxonError("focus_failed",
+                "Could not put the keyboard focus on that element, so the text would have gone to whatever window is in front instead.",
+                "Use replace:true, which writes through the element's value attribute and needs no focus at all.")
+        }
     } else {
         let waited = try guardDisturb(a)
         if waited > 0 { res["waited_for_user_ms"] = waited }
@@ -769,6 +778,14 @@ func opPresence(_ a: [String: Any]) throws -> [String: Any] {
     return r
 }
 
+// Protocol parity with the Windows host, which uses this to place and label its
+// on-screen banner when more than one Claude session is running. macOS has no
+// banner, so there is nothing to place - but the op has to exist, or the MCP
+// layer would retry a failing call on every action.
+func opSession(_ a: [String: Any]) throws -> [String: Any] {
+    return ["ok": true, "banner": false]
+}
+
 func opPing(_ a: [String: Any]) throws -> [String: Any] {
     return [
         "ok": true,
@@ -785,6 +802,7 @@ func dispatch(_ op: String, _ a: [String: Any]) throws -> [String: Any] {
     switch op {
     case "ping": return try opPing(a)
     case "presence": return try opPresence(a)
+    case "session": return try opSession(a)
     case "list_apps": return try opListApps(a)
     case "snapshot": return try opSnapshot(a)
     case "click": return try opClick(a)

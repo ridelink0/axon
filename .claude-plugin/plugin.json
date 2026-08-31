@@ -41,6 +41,20 @@
       "default": "share",
       "description": "share = wait for a gap in your typing before using the cursor (recommended). yield = refuse while you are active. take = interrupt you."
     },
+    "confirm_consequential": {
+      "type": "string",
+      "title": "Ask before send, pay, and delete",
+      "required": false,
+      "default": "on",
+      "description": "on = a control labelled Send, Pay, Place order, Delete and the like is refused once, so Claude has to tell you what it is about to do and get your answer before clicking it. off = no such gate."
+    },
+    "desktop_scope": {
+      "type": "string",
+      "title": "Virtual desktops Claude may work on",
+      "required": false,
+      "default": "all",
+      "description": "all = Claude can see and drive windows on any of your virtual desktops, and a window on another one is labelled as such. current = Claude is confined to the desktop you are looking at; windows on your other desktops are invisible to it and refused if it names one by handle. Either way it can only read a window's frame while that window is on a desktop you are not viewing - Windows does not serve the contents of one."
+    },
     "user_idle_ms": {
       "type": "number",
       "title": "Idle threshold (ms)",

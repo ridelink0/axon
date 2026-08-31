@@ -84,7 +84,7 @@ Measured during the test suite: Computer Use fired 36 input events, and the pres
 tracker counted **zero** user activity from them.
 
 ```
-injected +36, real +0, idle now 3443ms
+injected +36, real +0, idle now 5395ms
 ```
 
 That is the whole feature in one line. It knows the difference.
@@ -99,14 +99,88 @@ There is no idle detection and no user-disturbance prevention there. On macOS it
 solves the problem the other way, with a sandboxed second session. Computer Use solves it
 on the shared desktop, on both.
 
+## And out of the other Claude's way
+
+You can also run more than one Claude Code session against the same desktop.
+That is a different problem from coexisting with a human, and the injected-input
+flag cannot solve it: a second Claude's input is flagged synthetic too, so every
+session would see the other one's typing as "not the user" and type straight
+over it.
+
+So sessions register with each other, in a directory the install shares:
+
+- **Input is serialised.** One session sends input at a time; the others queue
+  behind a machine-wide lease and are told they waited. A session that dies
+  holding it loses it - liveness is the process, not a timeout.
+- **Each session gets its own banner row and its own Stop button**, so a second
+  Claude can never hide the first one's way out. Once there are two, each banner
+  says which session it is. Escape still stops all of them at once.
+- **Each session gets its own cursor, in its own colour.** Session one stays
+  Claude's orange, so nothing changes when you run one; a second session draws
+  in teal, a third in violet. A session's cursor, marker, banner and ring all
+  share that colour, so "which Claude just clicked that" is answerable at a
+  glance, and two cursors on the same control are staggered so both stay
+  visible. Every session's chrome is invisible to every other session's
+  listings, so no Claude can target another Claude's banner.
+- **Grants never cross sessions.** Session 2 has to ask for its own.
+- **Working in the same window as another session is called out** in the result,
+  because that is the one case where two correct agents still produce nonsense.
+- **`computer_status` names the other sessions** and what they last touched.
+
+A session that goes quiet keeps its slot - it is idle, not gone. Only a dead
+process is pruned.
+
+## More than one desktop
+
+**Several monitors** need nothing from you. Everything is in virtual-screen
+coordinates, so rects, clicks and captures are right on any display, including
+ones left of or above the primary where coordinates go negative. The banner
+picks the monitor holding the window you are working in, rather than centring on
+the virtual screen - which on two monitors is the seam between them.
+
+**Windows virtual desktops** are the interesting case, and there is one honest
+limit. Windows serves the *frame* of a window on a desktop you are not looking
+at - title bar, minimise, maximise, close - and none of its contents. That is
+the operating system's decision, not something a plugin can route around. So:
+
+- A window on another desktop is still listed, by `computer_apps
+  { include_hidden: true }`, marked `[other virtual desktop]`. It does not
+  silently vanish the moment you switch away, which is what happens if you only
+  ask the accessibility tree.
+- Reading one tells Claude plainly that only the frame is available and why, so
+  it reports "that window is on your other desktop" instead of "that app appears
+  to be empty".
+- **The banner follows you.** Switch desktops mid-run and the "Claude is using
+  your computer" banner, and its Stop button, come with you. An agent whose only
+  visible stop is on a desktop you are not looking at is an agent you cannot
+  stop.
+- Set **Virtual desktops Claude may work on** to `current` in the plugin
+  settings to confine a session to the desktop you are on: windows elsewhere
+  become invisible to it, and naming one by handle is refused. `all`, the
+  default, lets it see them and say where they are.
+
+`node tools/desktop-test.mjs` proves this on your machine. It creates a second
+virtual desktop, checks all of the above, and closes it again.
+
+## Before it sends, pays, or deletes
+
+A control whose own label reads `Send`, `Pay`, `Place order`, `Delete` or
+`Publish` is refused the first time, naming the control. Claude has to tell you
+what it is about to do and get an answer before it can press it.
+
+This is the one thing OpenAI's agent got unambiguously right: an agent holding
+your real accounts should stop at the point of no return, not after it. Reading
+is never gated and ordinary controls click straight through; turn the gate off
+in the plugin settings if you would rather it did not.
+
 ## The cost difference
 
 | | tokens |
 |---|---:|
-| Reading a window as a tree | **~457** |
-| The same window as a screenshot | **~10,600** |
+| Reading a window as a tree | **~478** |
+| The same window as a screenshot | **~10,719** |
 
-**Twenty-three times.** Run `node tools/mcp-test.mjs`; it prints this at the end
+**Twenty-two times.** Run `node tools/mcp-test.mjs`; it prints this at the end
 of every run, on your machine, with your windows.
 
 And the tree is not just cheaper, it is better:
@@ -193,7 +267,7 @@ result says `exclusive_unavailable`. Escape releases it regardless. It is
 opt-in and never the default, precisely because a locked-out user cannot reach
 the Stop button — Escape is why it is safe to offer at all.
 
-Twelve tools, about **1,380 tokens** of always-on cost. One screenshot you did
+Twelve tools, about **1,580 tokens** of always-on cost. One screenshot you did
 not take pays for that eight times over.
 
 ## What it will not do
@@ -206,6 +280,9 @@ Reading is free. Acting needs a grant, per app, for that session only.
 | `sensitive` | grantable, but it tells Claude what that app reaches. A browser carries every session you are signed in to. |
 | `shell` | terminals and editors. Readable, **never typeable** — anything typed there runs as you. |
 | `blocked` | password managers, UAC prompts, login screens. **Not even readable**, because their accessibility tree has the secrets in plain text. |
+
+**It cannot answer for you at the point of no return.** Send, pay, order and
+delete controls need an explicit confirmation, per click.
 
 **It cannot kill a process.** There is no such tool. `computer_close_window` asks one
 window to close, exactly as clicking its X does, so the app can still offer to
@@ -250,19 +327,27 @@ will fix it.
 ## Tests
 
 ```
-node tools/test-all.mjs        all 224
-node tools/verify.mjs         28  drives real windows end to end, cursor never moves
-node tools/policy-test.mjs      57  tiers, grants, refusals
-node tools/presence-test.mjs    25  telling you apart from Computer Use, overlay, modes
+node tools/test-all.mjs        all 320
+node tools/verify.mjs           33  drives real windows end to end, cursor never moves
+node tools/policy-test.mjs      70  tiers, grants, refusals, what needs confirming
+node tools/sessions-test.mjs    48  two Claudes: slots, the input lease, dead sessions
+node tools/presence-test.mjs    32  telling you apart from Computer Use, overlay, banner
 node tools/build-test.mjs       13  compile, idempotence, concurrent builds
-node tools/host-test.mjs        52  tree, patterns, input, crash recovery
-node tools/mcp-test.mjs         49  the protocol end to end, prints token costs
+node tools/host-test.mjs        57  tree, patterns, input, crash recovery
+node tools/mcp-test.mjs         67  the protocol end to end, prints token costs
+
+and one that is deliberately not in that run, because it moves your screen:
+
+node tools/desktop-test.mjs     11  a real second virtual desktop, created and closed
 ```
 
 They build their own throwaway window and never touch anything already open.
 Past the happy paths they cover stale indices, a host killed mid-session, five
 concurrent calls, a window covered by another window, minimized windows, two
-sessions compiling at once, and every error code.
+sessions compiling at once, a session that died holding the input lease, a
+registry that cannot be written to, a window parked under the banner, a tree too
+slow to finish reading, typing that would have landed in the wrong window, and
+every error code.
 
 ## Where the idea came from
 

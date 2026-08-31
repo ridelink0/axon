@@ -16,9 +16,12 @@ export class HostError extends Error {
 }
 
 export class Driver {
-  constructor({ timeoutMs = 30000, onLog = () => {} } = {}) {
+  constructor({ timeoutMs = 30000, onLog = () => {}, env = null } = {}) {
     this.timeoutMs = timeoutMs;
     this.onLog = onLog;
+    // Extra environment for the host - which overlay slot this session owns, and
+    // what to call it on screen when more than one Claude is running.
+    this.env = env;
     this.proc = null;
     this.seq = 0;
     this.pending = new Map();
@@ -43,7 +46,11 @@ export class Driver {
         return;
       }
 
-      const proc = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      const proc = spawn(exe, [], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: this.env ? { ...process.env, ...this.env } : process.env,
+      });
       this.proc = proc;
 
       const rl = createInterface({ input: proc.stdout });

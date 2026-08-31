@@ -98,6 +98,28 @@ async function main() {
   check('captures text below the fold', notes && notes.text && notes.text.includes('line 40 of hidden'),
         notes && notes.text ? `tail=${JSON.stringify(notes.text.slice(-40))}` : 'no text');
 
+  console.log('\n-- a snapshot always comes back --');
+  {
+    // A node cap bounds how big a tree is, not how long it takes to read. An
+    // Electron window can spend tens of milliseconds per node, and enough of
+    // those runs past the caller's timeout with the host still walking. So the
+    // walk has a wall clock. Forced to 1ms here, it must return a partial tree
+    // and say so, rather than running to completion or failing.
+    process.env.CU_SNAPSHOT_MS = '1';
+    const slow = new Driver({ onLog: () => {} });
+    await slow.start();
+    const t = Date.now();
+    const s = (await slow.call('snapshot', { hwnd })).result;
+    const ms = Date.now() - t;
+    delete process.env.CU_SNAPSHOT_MS;
+    check('a tight time budget still returns a tree', s.node_count >= 1, String(s.node_count));
+    check('it returns fast', ms < 5000, `${ms}ms`);
+    check('it is marked truncated', s.truncated === true);
+    check('and says the budget is why', s.time_budget_ms === 1, JSON.stringify(s.time_budget_ms));
+    check('a budgeted snapshot is still actionable', typeof s.snapshot_id === 'string');
+    await slow.stop();
+  }
+
   console.log('\n-- click via Invoke pattern --');
   const clicked = (await d.call('click', { snapshot_id: snap.snapshot_id, index: button.i })).result;
   check('click used the pattern path', clicked.method === 'invoke_pattern', `method=${clicked.method}`);
@@ -131,7 +153,7 @@ async function main() {
   check('wait_for times out with a typed error', waitErr && waitErr.code === 'wait_timeout', waitErr && waitErr.code);
 
   console.log('\n-- scroll --');
-  const sc = (await d.call('scroll', { snapshot_id: snap.snapshot_id, index: notes.i, amount: -3 })).result;
+  const sc = (await d.call('scroll', { snapshot_id: snap.snapshot_id, index: notes.i, amount: -3, mode: 'take' })).result;
   check('scroll returns a method', !!sc.method, JSON.stringify(sc));
 
   console.log('\n-- screenshot --');
@@ -172,8 +194,11 @@ async function main() {
   }
 
   console.log('\n-- key chord --');
-  await d.call('focus', { hwnd });
-  const k = (await d.call('key', { keys: 'ctrl+a' })).result;
+  // mode take: this suite is deliberately driving a window it created itself,
+  // and must not fail because the person at the machine happens to be typing.
+  // Whether Computer Use waits for them is presence-test's job, not this one's.
+  await d.call('focus', { hwnd, mode: 'take' });
+  const k = (await d.call('key', { keys: 'ctrl+a', hwnd, mode: 'take' })).result;
   check('key chord sends', k.sent === 'ctrl+a');
 
   console.log('\n-- close our own target --');

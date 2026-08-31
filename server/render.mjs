@@ -35,7 +35,12 @@ function preview(s, limit) {
   return `${JSON.stringify(flat.slice(0, head))} … ${JSON.stringify(flat.slice(-tail))} [${flat.length} chars]`;
 }
 
-export function renderSnapshot(snap, { textLimit = 200, withRects = false } = {}) {
+// Past this many characters a read is worth a sentence about how to make the
+// next one smaller. Roughly 3,000 tokens: still far under a screenshot, but
+// enough that a conversation full of them is what fills a context window.
+const CHATTY = 12000;
+
+export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean = false } = {}) {
   const lines = [];
   const head = [`${snap.snapshot_id} "${snap.title || '(untitled)'}" hwnd=${snap.hwnd}`];
 
@@ -75,10 +80,28 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false } = {}
     rows.push(line);
   }
 
-  head.push(`${rows.length} shown${pruned ? `, ${pruned} layout-only hidden` : ''}${snap.truncated ? ', TRUNCATED (raise max_nodes or use interactive_only)' : ''}`);
+  // Windows serves only a cloaked window's frame - title bar, minimise,
+  // maximise, close - and none of its contents, so what comes back looks like
+  // an application with nothing in it. Saying why is the difference between a
+  // dead end and a next step.
+  const elsewhere = snap.other_desktop
+    ? ' | ON ANOTHER VIRTUAL DESKTOP: only the window frame is readable, because Windows does not serve the contents of a window on a desktop you are not looking at. This is not an empty or broken app. Its coordinates are not on screen either, so a physical click or point target would land on whatever the user has in front of them. Bring that desktop forward before driving this window'
+    : '';
+  const cut = snap.time_budget_ms
+    ? `, TRUNCATED after ${snap.time_budget_ms}ms - this window's tree is slow to read; use interactive_only, or snapshot a smaller window`
+    : (snap.truncated ? ', TRUNCATED (raise max_nodes or use interactive_only)' : '');
+  head.push(`${rows.length} shown${pruned ? `, ${pruned} layout-only hidden` : ''}${cut}${elsewhere}`);
   lines.push(head.join(' | '), '');
   lines.push(...rows);
-  return lines.join('\n');
+  const out = lines.join('\n');
+  // Said in the output rather than in the docs, because the moment it matters
+  // is the moment a big page has just been read - not before.
+  if (!lean && out.length > CHATTY) {
+    return out + `\n\n[this read cost about ${Math.round(out.length / 4)} tokens. ` +
+      'If you only need controls, re-read with interactive_only:true; if you need one part of ' +
+      'the page, target it with a selector rather than reading the whole tree again.]';
+  }
+  return out;
 }
 
 export function renderApps(windows, policy, classify) {
@@ -92,6 +115,7 @@ export function renderApps(windows, policy, classify) {
     const t = (tier + granted).padEnd(10);
     let title = oneLine(w.title, 60) || '(untitled)';
     if (w.minimized) title += ' [minimized]';
+    if (w.other_desktop) title += ' [other virtual desktop]';
     if (w.foreground) title += ' [foreground]';
     lines.push(`${hwnd} ${t} ${app} ${title}`);
   }

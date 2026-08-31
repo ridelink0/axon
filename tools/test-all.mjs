@@ -15,6 +15,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // the two that operate real windows, then the full MCP path.
 const suites = [
   'policy-test.mjs',
+  'sessions-test.mjs',
   'build-test.mjs',
   'verify.mjs',
   'presence-test.mjs',

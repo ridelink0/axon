@@ -7,14 +7,27 @@
 
 import { createInterface } from 'node:readline';
 import { Driver, HostError } from './driver.mjs';
-import { Policy, classify, TIER } from './policy.mjs';
+import { Policy, classify, isConsequential, TIER } from './policy.mjs';
 import { renderSnapshot, renderApps } from './render.mjs';
 import { profileHint } from './profiles.mjs';
+import { Sessions, LeaseBusy } from './sessions.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const SERVER_INFO = { name: 'computer-use', version: '0.1.0' };
 
-const driver = new Driver({ onLog: (m) => process.stderr.write('[computer-use] ' + m + '\n') });
+// Other Claude Code sessions driving this same desktop. Registered before the
+// host starts, so the banner knows which slot it owns and never lands on top of
+// another session's Stop button.
+const sessions = new Sessions();
+sessions.register();
+
+const driver = new Driver({
+  onLog: (m) => process.stderr.write('[computer-use] ' + m + '\n'),
+  env: {
+    CU_SESSION_SLOT: String(sessions.slot),
+    CU_SESSION_LABEL: sessions.label,
+  },
+});
 const policy = new Policy();
 policy.markSelf([process.pid, process.ppid]);
 
@@ -47,6 +60,22 @@ function presenceNote(p) {
   const what = p.last_input === 'keyboard' ? 'typing' : 'moving the mouse';
   return `[user present: ${what} ${p.idle_ms}ms ago. Reading and pattern-based actions are unaffected; anything needing the cursor or foreground will wait for a gap.]
 `;
+}
+
+// The banner has to know how many Claudes are on this desktop, because it only
+// names itself when there is another one to be confused with. The count lives
+// here - this is the layer that reads the registry - and is pushed to the host
+// only when it changes.
+let lastPeerCount = -1;
+
+async function syncSessionUi() {
+  const n = sessions.peers().length;
+  if (n === lastPeerCount || !driver.proc) return n;
+  try {
+    await driver.call('session', { slot: sessions.slot, label: sessions.label, peers: n }, { timeoutMs: 4000 });
+    lastPeerCount = n;
+  } catch { /* an older host without the op, or a host that just died */ }
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +156,7 @@ const TOOLS = [
       button: { type: 'string', enum: ['left', 'right', 'middle'] },
       clicks: int,
       physical: { type: 'boolean', description: 'Force a real mouse click.' },
+      confirmed: { type: 'boolean', description: 'Set only after telling the user what a send/pay/delete-style control will do and getting their go-ahead.' },
     } },
   },
   {
@@ -225,13 +255,51 @@ let lastSnapshotId = null;
 // whichever one that snapshot was taken from. Bounded, because a long session
 // takes many snapshots and the host only retains the last few anyway.
 const snapshotWindow = new Map();
+// What each index in a snapshot was called, so an action by index can be
+// described in words rather than as a number - both to the user, and to the
+// consequence check below.
+const snapshotNames = new Map();
 const MAX_TRACKED_SNAPSHOTS = 16;
 
-function trackSnapshot(id, hwnd) {
+function trackSnapshot(id, hwnd, nodes) {
   snapshotWindow.set(id, hwnd);
-  while (snapshotWindow.size > MAX_TRACKED_SNAPSHOTS) {
-    snapshotWindow.delete(snapshotWindow.keys().next().value);
+  const names = new Map();
+  for (const n of nodes || []) {
+    if (n.name || n.role) names.set(Number(n.i), { name: n.name || '', role: n.role || '' });
   }
+  snapshotNames.set(id, names);
+  while (snapshotWindow.size > MAX_TRACKED_SNAPSHOTS) {
+    const oldest = snapshotWindow.keys().next().value;
+    snapshotWindow.delete(oldest);
+    snapshotNames.delete(oldest);
+  }
+}
+
+// What the thing being acted on is called, when that is knowable without asking
+// the host again.
+function targetName(args) {
+  if (args.selector && args.selector.name) return String(args.selector.name);
+  if (args.index == null) return null;
+  const sid = args.snapshot_id || lastSnapshotId;
+  const names = snapshotNames.get(sid);
+  const hit = names && names.get(Number(args.index));
+  return hit && hit.name ? hit.name : null;
+}
+
+// Which control names count as a point of no return is a policy question, so
+// it lives with the other tier rules and is tested there.
+const CONFIRM_ENABLED = !/^(off|false|0|no)$/i.test(String(process.env.CU_CONFIRM || '').trim());
+
+function consequenceCheck(op, args) {
+  if (!CONFIRM_ENABLED) return null;
+  if (op !== 'click') return null;
+  if (args.confirmed === true) return null;
+  const name = targetName(args);
+  if (!isConsequential(name)) return null;
+  return fail('needs_confirmation',
+    `"${name}" reads as an action with consequences outside this machine - money, a message that leaves, or something that cannot be undone.`,
+    `Tell the user in plain words exactly what you are about to do and what it will cost or send, get their answer, then repeat this call with confirmed:true. ` +
+    `If they already asked for this specific action in this conversation, that counts - say what you are doing and pass confirmed:true.`);
 }
 
 async function windowForAction(args) {
@@ -243,6 +311,36 @@ async function windowForAction(args) {
     return wins.find((x) => Number(x.hwnd) === Number(hwnd)) || null;
   }
   return null;
+}
+
+// Which virtual desktops Claude may work on. "all" lets it see and drive
+// windows wherever they are, saying which desktop they are on; "current"
+// confines it to the desktop the user is actually looking at, so a session left
+// running cannot reach across into another one. An unset plugin setting arrives
+// as its own placeholder text, which means the default.
+const DESKTOP_SCOPE =
+  /^current$/i.test(String(process.env.CU_DESKTOP_SCOPE || '').trim()) ? 'current' : 'all';
+
+function offDesktopCheck(win) {
+  if (DESKTOP_SCOPE !== 'current' || !win || !win.other_desktop) return null;
+  return fail('other_desktop',
+    `"${win.title || win.process}" is on a different virtual desktop, and this install is set to work only on the desktop you are looking at.`,
+    'Switch to that desktop, or set the plugin\'s "Virtual desktops Claude may work on" setting to "all".');
+}
+
+// The tier rule for pixels lives in policy, where the tier rule for trees
+// lives; this only fetches the current windows for it to judge.
+async function blockedInFrame(win) {
+  return policy.blockedInFrame(await listWindows({ fresh: true }), win);
+}
+
+function blockedShotError(exposed, scoped) {
+  return fail('blocked_on_screen',
+    `A credential or security window ("${exposed.process || exposed.title}") is ${scoped ? 'covering part of that window' : 'on screen'}, ` +
+    `so this capture is refused - it would expose what the blocked tier is meant to protect.`,
+    scoped
+      ? 'Move or close that window first, or read this window as a tree with computer_snapshot, which cannot see through it.'
+      : 'Screenshot a specific window with hwnd instead, or close that window first.');
 }
 
 function injectionBanner(win) {
@@ -260,8 +358,9 @@ function injectionBanner(win) {
 const handlers = {
   async computer_apps(args) {
     const wins = await listWindows({ includeHidden: !!args.include_hidden, fresh: true });
-    const visible = wins.filter((w) => !policy.isSelf(w));
-    return text(renderApps(visible, policy, classify));
+    const visible = wins.filter((w) => !policy.isSelf(w))
+      .filter((w) => DESKTOP_SCOPE !== 'current' || !w.other_desktop);
+    return text(sessions.note(null) + renderApps(visible, policy, classify));
   },
 
   async computer_status() {
@@ -280,6 +379,7 @@ const handlers = {
       `host: ${host}`,
       `dpi mode: ${dpi}`,
       `platform: ${process.platform}`,
+      `virtual desktops: ${DESKTOP_SCOPE === 'current' ? 'confined to the one you are looking at' : 'all of them'}`,
       '',
       `coexistence: ${p.monitoring ? 'monitoring' : 'UNAVAILABLE (input hooks did not install; Computer Use cannot tell you apart from itself and will not wait for you)'}`,
       p.monitoring ? `  user ${p.user_active ? 'ACTIVE - last input ' + p.idle_ms + 'ms ago (' + p.last_input + ')' : 'idle for ' + p.idle_ms + 'ms'}` : '',
@@ -292,6 +392,8 @@ const handlers = {
       grants.length
         ? 'input granted to:\n' + grants.map((g) => `  ${g.app} (${g.tier})`).join('\n')
         : 'input granted to: nothing yet',
+      '',
+      sessions.describe(),
     ];
     return text(lines.join('\n'));
   },
@@ -333,6 +435,8 @@ const handlers = {
     if (!win) return fail('window_not_found', 'No window matched.', 'Call computer_apps for current handles.');
     const check = policy.checkRead(win);
     if (!check.ok) return failCheck(check);
+    const elsewhere = offDesktopCheck(win);
+    if (elsewhere) return elsewhere;
 
     const { result } = await driver.call('snapshot', {
       hwnd: Number(win.hwnd),
@@ -342,11 +446,12 @@ const handlers = {
     });
     budget.snapshots++;
     lastSnapshotId = result.snapshot_id;
-    trackSnapshot(result.snapshot_id, Number(win.hwnd));
+    trackSnapshot(result.snapshot_id, Number(win.hwnd), result.nodes);
 
     let body = presenceNote(await presence()) + injectionBanner(win) + renderSnapshot(result, {
       textLimit: args.text_limit,
       withRects: !!args.with_rects,
+      lean: !!args.interactive_only,
     });
     const hint = profileHint(win);
     if (hint) body += `\n\napp notes: ${hint}`;
@@ -359,6 +464,9 @@ const handlers = {
       // visual detail the tree cannot describe. If the picture cannot be taken -
       // the window is minimized or closing - hand back the tree anyway.
       try {
+        const over = await blockedInFrame(win);
+        if (over) throw new HostError('blocked_on_screen',
+          `a credential or security window ("${over.process || over.title}") is covering part of it`, null);
         const shot = await driver.call('screenshot', { hwnd: Number(win.hwnd), max_width: 1100, quality: 60 });
         budget.shots++;
         budget.shotBytes += shot.result.bytes;
@@ -380,19 +488,16 @@ const handlers = {
       if (!win) return fail('window_not_found', 'No window matched.', 'Call computer_apps for current handles.');
       const check = policy.checkRead(win);
       if (!check.ok) return failCheck(check);
+      const over = await blockedInFrame(win);
+      if (over) return blockedShotError(over, true);
     } else {
       // A full-screen capture grabs whatever is on screen - which could be a
       // credential, elevation, or login surface that the blocked tier promises
       // is never readable. The tree refuses those; a whole-screen screenshot
       // must not be a way around that. Refuse while one is visible; a
       // window-scoped screenshot of something else is still fine.
-      const vis = await listWindows({ fresh: true });
-      const exposed = vis.find((w) => !w.minimized && !policy.isSelf(w) && classify(w).tier === TIER.BLOCKED);
-      if (exposed) {
-        return fail('blocked_on_screen',
-          `A credential or security window ("${exposed.process || exposed.title}") is on screen, so a full-screen capture is refused - it would expose what the blocked tier is meant to protect.`,
-          'Screenshot a specific window with hwnd instead, or close that window first.');
-      }
+      const exposed = await blockedInFrame(null);
+      if (exposed) return blockedShotError(exposed, false);
     }
     const { result } = await driver.call('screenshot', {
       hwnd: win ? Number(win.hwnd) : undefined,
@@ -417,10 +522,13 @@ const handlers = {
     if (!win) return fail('window_not_found', 'No window matched.', 'Call computer_apps for current handles.');
     const check = policy.checkAct(win);
     if (!check.ok) return failCheck(check);
-    const { result } = await driver.call('focus', { hwnd: Number(win.hwnd) });
-    return text(result.focused
+    const call = await sessions.withInput('focus', { hwnd: Number(win.hwnd), title: win.title },
+      () => driver.call('focus', { hwnd: Number(win.hwnd) }));
+    const { result } = call;
+    sessions.heartbeat({ last_op: 'focus', last_at: Date.now(), last_hwnd: Number(win.hwnd), last_title: win.title || null });
+    return text(sessions.note(Number(win.hwnd)) + (result.focused
       ? `focused "${result.title}".`
-      : `could not raise "${result.title}" - Windows refused the foreground change. It may be behind a modal dialog owned by another app.`);
+      : `could not raise "${result.title}" - Windows refused the foreground change. It may be behind a modal dialog owned by another app.`));
   },
 
   async computer_click(args)  { return act('click', args, (r) => `clicked via ${r.method}${r.toggle ? ` (now ${r.toggle})` : ''}${r.state ? ` (now ${r.state})` : ''}.`); },
@@ -455,6 +563,7 @@ const handlers = {
     if (!check.ok) return failCheck(check);
     const { result } = await driver.call('close_window', { hwnd: Number(win.hwnd) });
     windowCacheAt = 0;
+    sessions.heartbeat({ last_op: 'close_window', last_at: Date.now(), last_hwnd: Number(win.hwnd), last_title: win.title || null });
     return text(result.still_open
       ? `sent close to "${result.closed}" but it is still open - the app is probably asking whether to save.`
       : `closed "${result.closed}".`);
@@ -471,6 +580,15 @@ async function act(op, args, describe) {
   // all says so plainly instead of reporting whatever policy verdict the
   // last-snapshot fallback happened to land on.
   if (NEEDS_ELEMENT.has(op) && args.index == null && !args.selector && !args.point) {
+    // replace:true writes into one named field, so it needs to know which. The
+    // useful answer is usually not "go find an element" - it is "you do not
+    // need replace at all", which is the right call straight after a shortcut
+    // like ctrl+l that has already put the focus where you want it.
+    if (op === 'set_value') {
+      return fail('no_target', 'computer_type with replace:true writes into a specific field, so it needs one.',
+        'Drop replace to type at whatever currently has the keyboard focus - that is the right call after a shortcut such as ctrl+l. '
+        + 'Otherwise pass index or selector.');
+    }
     return fail('no_target', 'Provide index, selector, or point.',
       'Prefer an index from computer_snapshot; point is a last resort.');
   }
@@ -482,13 +600,34 @@ async function act(op, args, describe) {
   }
   const check = policy.checkAct(win);
   if (!check.ok) return failCheck(check);
+  const elsewhere = offDesktopCheck(win);
+  if (elsewhere) return elsewhere;
+
+  const stop = consequenceCheck(op, args);
+  if (stop) return stop;
 
   const payload = { ...args };
   delete payload.title;
+  delete payload.confirmed;
   payload.hwnd = Number(win.hwnd);
-  const { result } = await driver.call(op, payload);
 
-  let out = describe(result);
+  // One session at a time gets to touch the pointer, the foreground window and
+  // the keyboard. Reads never take the lease; everything here can end up
+  // sending input, so all of it does.
+  const call = await sessions.withInput(op, { hwnd: Number(win.hwnd), title: win.title },
+    () => driver.call(op, payload));
+  const { result } = call;
+  sessions.heartbeat({
+    last_op: op, last_at: Date.now(),
+    last_hwnd: Number(win.hwnd), last_title: win.title || null,
+  });
+
+  let out = sessions.note(Number(win.hwnd)) + describe(result);
+  const named = targetName(args);
+  if (named && args.confirmed === true) out += ` (confirmed consequential action: "${named}")`;
+  if (call.waited_for_session_ms) {
+    out += ` Waited ${call.waited_for_session_ms}ms for another Claude session to finish its action.`;
+  }
   // The host reports what the element looks like now, so Claude can verify the
   // action landed without spending a second call to find out.
   if (result.now) {
@@ -547,8 +686,15 @@ async function handleMessage(msg) {
     if (!fn) { replyError(id, -32601, `Unknown tool: ${name}`); return; }
     try {
       const result = await fn(args);
+      await syncSessionUi();
       reply(id, result);
     } catch (err) {
+      if (err instanceof LeaseBusy) {
+        reply(id, fail(err.code, err.message,
+          'Input is serialised across Claude sessions so two agents cannot type over each other. ' +
+          'Either wait and retry, or do the reading parts of the job now.'));
+        return;
+      }
       if (err instanceof HostError) {
         // Stop means stop. Withdrawing every grant makes that structural rather
         // than advisory: nothing can act again until the user says so.
@@ -584,6 +730,7 @@ rl.on('line', (line) => {
 });
 
 async function shutdown() {
+  try { sessions.close(); } catch {}
   try { await driver.stop(); } catch {}
   process.exit(0);
 }

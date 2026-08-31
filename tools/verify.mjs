@@ -146,6 +146,34 @@ async function main() {
     check('driving the back window left the front window untouched',
           frontStatusBefore === frontStatusAfter, `front was ${frontStatusBefore}, now ${frontStatusAfter}`);
     check('the front window still has its own controls', !!frontBtn);
+
+    // Keystrokes follow focus, not the window we name. Typing into a covered
+    // window must either put the text there or refuse - never let it fall
+    // through into whatever happens to be in front, which for the user could be
+    // a document, a chat, or a terminal.
+    const frontBox = node(frontSnap, (n) => n.name === 'Name field');
+    const frontTextBefore = frontBox && frontBox.text;
+    const backSnap = (await d.call('snapshot', { hwnd: backHwnd })).result;
+    const backBox = node(backSnap, (n) => n.name === 'Name field');
+    let typeErr = null;
+    try {
+      await d.call('type', {
+        hwnd: backHwnd, snapshot_id: backSnap.snapshot_id, index: backBox.i,
+        text: 'BEHIND', mode: 'take',
+      });
+    } catch (e) { typeErr = e; }
+
+    const backNow = (await d.call('snapshot', { hwnd: backHwnd })).result;
+    const frontNow = (await d.call('snapshot', { hwnd: frontHwnd })).result;
+    const backText = node(backNow, (n) => n.name === 'Name field')?.text || '';
+    const frontText = node(frontNow, (n) => n.name === 'Name field')?.text || '';
+
+    check('raw typing into a covered window either lands there or refuses',
+          typeErr ? typeErr.code === 'focus_failed' : backText.includes('BEHIND'),
+          typeErr ? typeErr.code : `back now ${JSON.stringify(backText)}`);
+    check('and never leaks into the window in front',
+          !frontText.includes('BEHIND'),
+          `front was ${JSON.stringify(frontTextBefore)}, now ${JSON.stringify(frontText)}`);
   }
 
   console.log('\n== the visible chrome ==');

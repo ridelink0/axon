@@ -1,6 +1,9 @@
 // Overlay - everything Computer Use puts on screen.
 //
-// Four windows, one colour:
+// Four windows in one colour - and one colour per Claude. A second session on
+// the same desktop draws its own cursor, marker, ring and banner in the next
+// hue along, so two agents working at once are two things you can tell apart
+// rather than one thing behaving strangely:
 //   - a ring around the whole desktop while it is working (click-through)
 //   - a banner reading "Claude is using your computer", with Stop
 //   - a Claude-coloured cursor showing where it is, alongside yours
@@ -60,6 +63,42 @@ namespace Axon
         // and marker all draw from it, so this reads as one thing rather than as
         // a colour scheme.
         internal static readonly Color Claude = Color.FromArgb(217, 119, 87);   // #D97757
+
+        // With two Claudes on one desktop there are two cursors, two markers and
+        // two banners, and they are all the same shape. Colour is what tells
+        // them apart - the same thing a shared document does for two people
+        // editing it. Session one keeps Claude's own colour, so a single session
+        // looks exactly as it always did; later sessions take the next hue.
+        // Whichever colour a cursor is, the banner and marker of that session
+        // match it, so "who just clicked that" is answerable at a glance.
+        static readonly Color[] Accents = new Color[]
+        {
+            Color.FromArgb(217, 119, 87),    // #D97757  Claude
+            Color.FromArgb( 61, 152, 173),   // #3D98AD  teal
+            Color.FromArgb(139, 111, 196),   // #8B6FC4  violet
+            Color.FromArgb( 90, 158, 106),   // #5A9E6A  green
+            Color.FromArgb(198, 133, 61),    // #C6853D  amber
+            Color.FromArgb(190, 96, 122),    // #BE607A  rose
+        };
+
+        internal static Color Accent
+        {
+            get
+            {
+                int i = _slot;
+                if (i < 0) i = 0;
+                return Accents[i % Accents.Length];
+            }
+        }
+
+        internal static string AccentHex
+        {
+            get
+            {
+                Color c = Accent;
+                return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2");
+            }
+        }
         internal static readonly Color Ink = Color.FromArgb(20, 20, 19);        // #141413
         internal static readonly Color Paper = Color.FromArgb(250, 249, 245);   // #FAF9F5
 
@@ -75,6 +114,30 @@ namespace Axon
         static IntPtr _markerHwnd, _ringHwnd, _bannerHwnd, _cursorHwnd;
         static string _fontName;
 
+        // Which banner row this session owns, and what to call it. Two Claude
+        // Code sessions on one desktop would otherwise draw the same banner in
+        // the same place, hiding one Stop button behind the other - so each
+        // session gets its own row, and says which one it is.
+        static int _slot;
+        static string _sessionLabel;
+        static int _peers;
+
+        internal static void Configure(int slot, string label, int peers)
+        {
+            _slot = slot < 0 ? 0 : (slot > 8 ? 8 : slot);
+            _sessionLabel = label;
+            _peers = peers < 0 ? 0 : peers;
+            if (!Enabled || _banner == null) return;
+            try
+            {
+                _banner.BeginInvoke((MethodInvoker)delegate
+                {
+                    try { _banner.Relayout(); } catch { }
+                });
+            }
+            catch { }
+        }
+
         internal static bool Enabled { get { return _enabled && _ready; } }
         internal static bool StopRequested { get { return _stopRequested; } }
 
@@ -82,6 +145,85 @@ namespace Axon
         {
             if (h == IntPtr.Zero) return false;
             return h == _markerHwnd || h == _ringHwnd || h == _bannerHwnd || h == _cursorHwnd;
+        }
+
+        // Every overlay window carries a window property naming it as ours, so
+        // ANY Computer Use host can recognise ANY other one's chrome. Without
+        // this, a second Claude session's banner is just an unexplained window
+        // to the first: listable, targetable, and clickable. A window property
+        // is readable across processes and dies with the window, so there is
+        // nothing to clean up and nothing to get out of date.
+        const string MarkerProp = "ComputerUseOverlayWindow";
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool SetPropW(IntPtr h, string name, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetPropW(IntPtr h, string name);
+        [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr h, int index);
+        [DllImport("user32.dll")] static extern int SetWindowLongW(IntPtr h, int index, int value);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out NRECT r);
+
+        [StructLayout(LayoutKind.Sequential)] internal struct NRECT { public int Left, Top, Right, Bottom; }
+
+        const int GWL_EXSTYLE = -20;
+        const int WS_EX_TRANSPARENT = 0x00000020;
+
+        internal static bool IsAnyOverlayWindow(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            if (IsOwnWindow(h)) return true;
+            try { return GetPropW(h, MarkerProp) != IntPtr.Zero; }
+            catch { return false; }
+        }
+
+        static void Mark(IntPtr h)
+        {
+            try { SetPropW(h, MarkerProp, new IntPtr(1)); } catch { }
+        }
+
+        // The banner is the one overlay window that accepts clicks - Stop has to
+        // be pressable - which means it also swallows a real click aimed at
+        // whatever is underneath it. A control near the top of the screen is a
+        // perfectly ordinary thing to click. So for the length of one injected
+        // click the banner is made transparent to the mouse: it stays visible,
+        // it just stops being in the way. Returns true if that was needed.
+        internal static bool BeginClickThrough(int x, int y)
+        {
+            return BeginClickThroughRect(x, y, 1, 1);
+        }
+
+        // Takes the whole control, not just the point, because the banner does
+        // more than swallow the click: while it covers part of a control, the
+        // provider's own idea of where that control is clickable shifts to the
+        // sliver still showing, which puts the click on the element's edge and
+        // often misses it entirely. Stepping aside before the point is worked
+        // out is what makes a real click on a control near the top of the
+        // screen land where it should.
+        internal static bool BeginClickThroughRect(int x, int y, int w, int h_)
+        {
+            IntPtr h = _bannerHwnd;
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                NRECT r;
+                if (!GetWindowRect(h, out r)) return false;
+                if (x >= r.Right || x + w <= r.Left || y >= r.Bottom || y + h_ <= r.Top) return false;
+                int ex = GetWindowLongW(h, GWL_EXSTYLE);
+                if ((ex & WS_EX_TRANSPARENT) != 0) return false;
+                SetWindowLongW(h, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static void EndClickThrough()
+        {
+            IntPtr h = _bannerHwnd;
+            if (h == IntPtr.Zero) return;
+            try
+            {
+                int ex = GetWindowLongW(h, GWL_EXSTYLE);
+                SetWindowLongW(h, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+            }
+            catch { }
         }
 
         internal static bool ConsumeStop()
@@ -140,10 +282,10 @@ namespace Axon
         {
             try
             {
-                _marker = new MarkerForm(); _marker.CreateControl(); _markerHwnd = _marker.Handle; Exclude(_markerHwnd);
-                _ring = new RingForm(); _ring.CreateControl(); _ringHwnd = _ring.Handle; Exclude(_ringHwnd);
-                _banner = new BannerForm(); _banner.CreateControl(); _bannerHwnd = _banner.Handle; Exclude(_bannerHwnd);
-                _cursor = new CursorForm(); _cursor.CreateControl(); _cursorHwnd = _cursor.Handle; Exclude(_cursorHwnd);
+                _marker = new MarkerForm(); _marker.CreateControl(); _markerHwnd = _marker.Handle; Exclude(_markerHwnd); Mark(_markerHwnd);
+                _ring = new RingForm(); _ring.CreateControl(); _ringHwnd = _ring.Handle; Exclude(_ringHwnd); Mark(_ringHwnd);
+                _banner = new BannerForm(); _banner.CreateControl(); _bannerHwnd = _banner.Handle; Exclude(_bannerHwnd); Mark(_bannerHwnd);
+                _cursor = new CursorForm(); _cursor.CreateControl(); _cursorHwnd = _cursor.Handle; Exclude(_cursorHwnd); Mark(_cursorHwnd);
 
                 _idleTimer = new System.Windows.Forms.Timer();
                 _idleTimer.Interval = 2200;
@@ -171,8 +313,112 @@ namespace Axon
             try { SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE); } catch { }
         }
 
+        // When Computer Use last began doing something. Escape reads this to tell
+        // "stop what you are doing" from an Escape the user pressed in their own
+        // application while nothing of ours was running.
+        static long _lastActiveTicks;
+
+        internal static bool ActiveWithin(int ms)
+        {
+            long t = System.Threading.Interlocked.Read(ref _lastActiveTicks);
+            if (t == 0) return false;
+            return (DateTime.UtcNow.Ticks - t) / TimeSpan.TicksPerMillisecond < ms;
+        }
+
+        // ------------------------------------------------------------------
+        // Virtual desktops.
+        //
+        // A window belongs to the desktop it was created on. So the banner that
+        // says "Claude is using your computer", and the Stop button on it, are
+        // invisible the moment the user switches to another virtual desktop -
+        // which is precisely when they are most entitled to know that something
+        // is still driving their machine. Windows exposes a documented way for a
+        // process to move its OWN windows between desktops, so the chrome
+        // follows the person rather than staying where it was born.
+        //
+        // On a Windows without the interface, every call here is a no-op and
+        // nothing else changes.
+        [ComImport, Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")]
+        class VirtualDesktopManagerClass { }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B")]
+        interface IVirtualDesktopManager
+        {
+            [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr hwnd, out int onCurrent);
+            [PreserveSig] int GetWindowDesktopId(IntPtr hwnd, out Guid desktopId);
+            [PreserveSig] int MoveWindowToDesktop(IntPtr hwnd, ref Guid desktopId);
+        }
+
+        static IVirtualDesktopManager _desktops;
+        static bool _desktopsTried;
+        static int _lastFollowTick;
+
+        static IVirtualDesktopManager Desktops
+        {
+            get
+            {
+                if (!_desktopsTried)
+                {
+                    _desktopsTried = true;
+                    try { _desktops = (IVirtualDesktopManager)new VirtualDesktopManagerClass(); }
+                    catch { _desktops = null; }
+                }
+                return _desktops;
+            }
+        }
+
+        // 1 = on the desktop the user is looking at, 0 = on another one,
+        // -1 = this Windows cannot say.
+        internal static int OnCurrentDesktop(IntPtr h)
+        {
+            IVirtualDesktopManager vdm = Desktops;
+            if (vdm == null || h == IntPtr.Zero) return -1;
+            try
+            {
+                int on;
+                if (vdm.IsWindowOnCurrentVirtualDesktop(h, out on) != 0) return -1;
+                return on != 0 ? 1 : 0;
+            }
+            catch { return -1; }
+        }
+
+        // Is this session's banner - the thing carrying the Stop button - on the
+        // desktop the user is actually looking at? The whole accountability
+        // story depends on the answer being yes.
+        internal static int OverlayHere() { return OnCurrentDesktop(_bannerHwnd); }
+
+        static void FollowToCurrentDesktop()
+        {
+            IVirtualDesktopManager vdm = Desktops;
+            if (vdm == null || _bannerHwnd == IntPtr.Zero) return;
+            // Cheap, but not free, and this runs on every action.
+            int now = Environment.TickCount;
+            if (now - _lastFollowTick < 1000 && _lastFollowTick != 0) return;
+            _lastFollowTick = now;
+            try
+            {
+                if (OnCurrentDesktop(_bannerHwnd) != 0) return;
+
+                // Which desktop is current? Ask a window that is already on it.
+                IntPtr fg = Native.GetForegroundWindow();
+                if (fg == IntPtr.Zero || IsAnyOverlayWindow(fg)) return;
+                Guid id;
+                if (vdm.GetWindowDesktopId(fg, out id) != 0 || id == Guid.Empty) return;
+
+                IntPtr[] all = new IntPtr[] { _markerHwnd, _ringHwnd, _bannerHwnd, _cursorHwnd };
+                foreach (IntPtr h in all)
+                {
+                    if (h == IntPtr.Zero) continue;
+                    try { vdm.MoveWindowToDesktop(h, ref id); } catch { }
+                }
+            }
+            catch { }
+        }
+
         internal static void MarkActive()
         {
+            FollowToCurrentDesktop();
+            System.Threading.Interlocked.Exchange(ref _lastActiveTicks, DateTime.UtcNow.Ticks);
             if (!Enabled || _banner == null) return;
             try
             {
@@ -399,7 +645,7 @@ namespace Axon
 
             protected override void Render(Graphics g)
             {
-                using (Pen pen = new Pen(Claude, RingW))
+                using (Pen pen = new Pen(Accent, RingW))
                 {
                     pen.Alignment = PenAlignment.Inset;
                     g.DrawRectangle(pen, new Rectangle(0, 0, Width - 1, Height - 1));
@@ -431,8 +677,47 @@ namespace Axon
         // clicks through on their own.
         sealed class BannerForm : GhostForm
         {
-            const string Message = "Claude is using your computer";
+            const string BaseMessage = "Claude is using your computer";
             const string Action_ = "Stop";
+
+            // Only says which session it is when there is another one to be
+            // confused with. One Claude on the machine needs no qualifier.
+            static string MessageText()
+            {
+                if (_peers > 0 && !string.IsNullOrEmpty(_sessionLabel))
+                    return BaseMessage + " (" + _sessionLabel + " of " + (_peers + 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+                return BaseMessage;
+            }
+
+            // Which monitor the banner belongs on. Centring it on the virtual
+            // screen looks right on one display and is wrong on two: the middle
+            // of the virtual screen is the seam between them, so the banner ends
+            // up split down the gap, or on whichever monitor happens to own the
+            // midpoint. It belongs on the screen the person is looking at, which
+            // is the one holding the window they are working in.
+            static Rectangle HostScreen()
+            {
+                try
+                {
+                    IntPtr fg = Native.GetForegroundWindow();
+                    if (fg != IntPtr.Zero && !IsAnyOverlayWindow(fg))
+                        return Screen.FromHandle(fg).Bounds;
+                }
+                catch { }
+                try { return Screen.PrimaryScreen.Bounds; }
+                catch { return SystemInformation.VirtualScreen; }
+            }
+
+            // Held for as long as the banner is up, so a change of foreground
+            // mid-run does not make it hop between monitors.
+            Rectangle _screen = Rectangle.Empty;
+
+            // Row for this session, one banner height apart, on its own monitor.
+            int RestY()
+            {
+                Rectangle sc = _screen.IsEmpty ? HostScreen() : _screen;
+                return sc.Y + 14 + _slot * (H + 10);
+            }
             const int H = 54, PadL = 20, PadR = 8, Gap = 16, StopH = 38, StopPadX = 20;
             const int DotSize = 8, DotGap = 12;
 
@@ -463,8 +748,20 @@ namespace Axon
 
             static int MeasureWidth()
             {
-                return PadL + DotSize + DotGap + Measure(Message, 11f, FontStyle.Regular)
+                return PadL + DotSize + DotGap + Measure(MessageText(), 11f, FontStyle.Regular)
                      + Gap + (Measure(Action_, 10.5f, FontStyle.Bold) + StopPadX * 2) + PadR;
+            }
+
+            // The label can change while the banner is up - another session
+            // starts, or the last one leaves - so it can be re-measured in place.
+            internal void Relayout()
+            {
+                if (!Visible) return;
+                int w = MeasureWidth();
+                Rectangle sc = _screen.IsEmpty ? HostScreen() : _screen;
+                Bounds = new Rectangle(sc.X + (sc.Width - w) / 2, RestY(), w, H);
+                LayoutStop();
+                Redraw();
             }
 
             void LayoutStop()
@@ -477,9 +774,10 @@ namespace Axon
             {
                 if (Visible) return;
                 int w = MeasureWidth();
-                Rectangle vs = SystemInformation.VirtualScreen;
-                int restY = vs.Y + 14;
-                Bounds = new Rectangle(vs.X + (vs.Width - w) / 2, restY - 8, w, H);
+                // Pick the monitor once, as it appears, and keep it.
+                _screen = HostScreen();
+                int restY = RestY();
+                Bounds = new Rectangle(_screen.X + (_screen.Width - w) / 2, restY - 8, w, H);
                 LayoutStop();
                 Alpha = 0;
                 Redraw();
@@ -548,7 +846,7 @@ namespace Axon
             protected override void Render(Graphics g)
             {
                 RectangleF body = new RectangleF(0, 0, Width, H);
-                using (SolidBrush bg = new SolidBrush(Claude))
+                using (SolidBrush bg = new SolidBrush(Accent))
                 using (GraphicsPath path = RoundRect(body, H / 2f))
                     g.FillPath(bg, path);
 
@@ -568,7 +866,7 @@ namespace Axon
                     sf.LineAlignment = StringAlignment.Center;
                     sf.FormatFlags = StringFormatFlags.NoWrap;
                     float x = PadL + DotSize + DotGap;
-                    g.DrawString(Message, f, fg, new RectangleF(x, 0, _stopRect.Left - Gap - x, H), sf);
+                    g.DrawString(MessageText(), f, fg, new RectangleF(x, 0, _stopRect.Left - Gap - x, H), sf);
                 }
 
                 Color fill = _pressed ? Shade(Paper, 0.12f) : (_hover ? Color.White : Paper);
@@ -606,6 +904,12 @@ namespace Axon
 
             internal void MoveTo(int x, int y)
             {
+                // Two sessions acting on the same control would put two cursors
+                // in exactly the same place, and the top one would be the only
+                // one you ever saw. A few pixels of stagger per session keeps
+                // both visible without moving either far from what it touched.
+                x += _slot * 11;
+                y += _slot * 7;
                 if (!Visible)
                 {
                     Location = new Point(x, y);
@@ -658,7 +962,7 @@ namespace Axon
             protected override void Render(Graphics g)
             {
                 using (GraphicsPath arrow = ArrowPath())
-                using (SolidBrush fill = new SolidBrush(Claude))
+                using (SolidBrush fill = new SolidBrush(Accent))
                 using (Pen edge = new Pen(Paper, 1.6f))
                 {
                     edge.LineJoin = LineJoin.Round;
@@ -668,12 +972,16 @@ namespace Axon
 
                 if (!_showLabel) return;
 
-                const string label = "Claude Cursor";
+                // Named for its session once there is another one to confuse it
+                // with, so the colour has a caption rather than being a code.
+                string label = (_peers > 0 && !string.IsNullOrEmpty(_sessionLabel))
+                    ? "Claude - " + _sessionLabel
+                    : "Claude Cursor";
                 using (Font f = new Font(UiFont, 9f, FontStyle.Regular))
                 {
                     SizeF sz = g.MeasureString(label, f);
                     RectangleF tag = new RectangleF(ArrowW + LabelGap, ArrowH * 0.45f, sz.Width + 18, sz.Height + 10);
-                    using (SolidBrush bg = new SolidBrush(Claude))
+                    using (SolidBrush bg = new SolidBrush(Accent))
                     using (GraphicsPath path = RoundRect(tag, tag.Height / 2f))
                         g.FillPath(bg, path);
                     using (SolidBrush fg = new SolidBrush(Paper))
@@ -733,7 +1041,7 @@ namespace Axon
             protected override void Render(Graphics g)
             {
                 Rectangle box = new Rectangle(4, TagH + 4, _target.Width, _target.Height);
-                using (Pen pen = new Pen(Claude, 2f))
+                using (Pen pen = new Pen(Accent, 2f))
                 {
                     pen.Alignment = PenAlignment.Inset;
                     g.DrawRectangle(pen, box);
@@ -744,7 +1052,7 @@ namespace Axon
                 {
                     SizeF sz = g.MeasureString(_label, f);
                     RectangleF tag = new RectangleF(4, 2, sz.Width + 18, TagH - 2);
-                    using (SolidBrush bg = new SolidBrush(Claude))
+                    using (SolidBrush bg = new SolidBrush(Accent))
                     using (GraphicsPath path = RoundRect(tag, (TagH - 2) / 2f))
                         g.FillPath(bg, path);
                     using (SolidBrush fg = new SolidBrush(Paper))

@@ -132,29 +132,113 @@ async function main() {
   console.log(`     ratio: screenshot is ${(shotTokens / snapTokens).toFixed(1)}x the tree`);
 
   console.log('\n-- permission gate --');
-  const ungranted = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
+  const ungranted = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
   check('acting without a grant is refused', ungranted.isError === true && body(ungranted).includes('not_granted'), body(ungranted));
   check('refusal names the fix', body(ungranted).includes('computer_grant'));
 
   const granted = await c.call('computer_grant', { hwnd });
   check('grant succeeds for a standard app', !granted.isError, body(granted));
 
-  const clicked = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
+  const clicked = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
   check('click works after grant', !clicked.isError && body(clicked).includes('invoke_pattern'), body(clicked));
 
-  const filled = await c.call('computer_type', { hwnd, selector: { name: 'Name field' }, text: 'Gerald', replace: true });
+  const filled = await c.call('computer_type', { hwnd, selector: { name: 'Name field' }, text: 'Gerald', replace: true, mode: 'take' });
   check('type replace:true uses the value pattern', body(filled).includes('value_pattern'), body(filled));
   const after = body(await c.call('computer_snapshot', { hwnd }));
   check('replaced text is readable back', after.includes('Gerald'), (after.split('\n').find((l) => l.includes('Name field')) || ''));
 
   const revoked = await c.call('computer_grant', { revoke: 'all' });
   check('revoke reports what it dropped', body(revoked).includes('revoked'), body(revoked));
-  const afterRevoke = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' } });
+  const afterRevoke = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
   check('revoke actually re-locks', afterRevoke.isError === true, body(afterRevoke));
 
   console.log('\n-- reading never needs a grant --');
   const readAfterRevoke = await c.call('computer_snapshot', { hwnd });
   check('snapshot still allowed with no grant', !readAfterRevoke.isError);
+
+  console.log('\n-- a control that spends money or sends something asks first --');
+  {
+    await c.call('computer_grant', { hwnd });
+    const pressed = () => {
+      const line = body(snapNow).split('\n').find((l) => l.includes('pressed:')) || '';
+      return line;
+    };
+    let snapNow = await c.call('computer_snapshot', { hwnd });
+    const before = pressed();
+
+    const gated = await c.call('computer_click', { hwnd, selector: { name: 'Send Payment' }, mode: 'take' });
+    check('a send/pay control is not clicked on sight',
+      gated.isError === true && body(gated).includes('needs_confirmation'), body(gated).slice(0, 160));
+    check('the refusal names the control', body(gated).includes('Send Payment'), body(gated).slice(0, 160));
+    check('it says what to do about it', body(gated).includes('confirmed:true'), body(gated).slice(0, 240));
+
+    snapNow = await c.call('computer_snapshot', { hwnd });
+    check('and nothing was actually pressed', pressed() === before, `${before} -> ${pressed()}`);
+
+    // The same gate has to hold when the target is an index, where the name is
+    // not in the call at all and has to come from the snapshot.
+    const idx = Number((body(snapNow).split('\n').find((l) => l.includes('"Send Payment"')) || '').match(/\[(\d+)\]/)?.[1]);
+    if (Number.isFinite(idx)) {
+      const byIndex = await c.call('computer_click', { hwnd, index: idx, mode: 'take' });
+      check('targeting by index does not slip past the gate',
+        byIndex.isError === true && body(byIndex).includes('needs_confirmation'), body(byIndex).slice(0, 160));
+    }
+
+    const ok = await c.call('computer_click', { hwnd, selector: { name: 'Send Payment' }, confirmed: true, mode: 'take' });
+    check('confirmed:true goes through', !ok.isError, body(ok).slice(0, 160));
+    check('and the result records that it was confirmed',
+      body(ok).includes('confirmed consequential action'), body(ok).slice(0, 200));
+
+    snapNow = await c.call('computer_snapshot', { hwnd });
+    check('the confirmed click really landed', pressed() !== before, `${before} -> ${pressed()}`);
+
+    const plain = await c.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
+    check('an ordinary control is not gated', !plain.isError, body(plain).slice(0, 120));
+    await c.call('computer_grant', { revoke: 'all' });
+  }
+
+  console.log('\n-- a second Claude session on the same computer --');
+  {
+    const alone = body(await c.call('computer_status'));
+    check('with one session, status says so', /other Claude sessions on this computer: none/.test(alone),
+      (alone.split('\n').find((l) => l.includes('other Claude')) || alone.slice(-200)));
+
+    const c2 = new Client();
+    await c2.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test2', version: '1' } });
+    c2.notify('notifications/initialized', {});
+    await c2.call('computer_apps');   // makes it start its host and heartbeat
+
+    const st1 = body(await c.call('computer_status'));
+    check('the first session now sees the second', /other Claude sessions on this computer: 1/.test(st1),
+      (st1.split('\n').find((l) => l.includes('other Claude')) || st1.slice(-260)));
+    check('it names which session that is', /session 2 \(pid \d+\)/.test(st1), st1.slice(-260));
+
+    const st2 = body(await c2.call('computer_status'));
+    check('and the second sees the first', /session 1 \(pid \d+\)/.test(st2), st2.slice(-260));
+    check('the second session knows it is session 2', /this session: session 2/.test(st2), st2.slice(-260));
+
+    // Grants must never be inherited: session 2 was never granted this app.
+    const notMine = await c2.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
+    check('a grant in one session does not act in another',
+      notMine.isError === true && body(notMine).includes('not_granted'), body(notMine).slice(0, 140));
+
+    // Peer presence is announced where a session starts looking.
+    const appsWith = body(await c2.call('computer_apps'));
+    check('the window listing announces the other session',
+      /other Claude session/.test(appsWith), appsWith.slice(0, 200));
+
+    await c2.call('computer_grant', { hwnd });
+    const bothAct = await c2.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
+    check('two sessions can both act, one at a time', !bothAct.isError, body(bothAct).slice(0, 200));
+
+    c2.stop();
+    await new Promise((r) => setTimeout(r, 600));
+    const st3 = body(await c.call('computer_status'));
+    check('a session that exits deregisters itself',
+      /other Claude sessions on this computer: none/.test(st3),
+      (st3.split('\n').find((l) => l.includes('other Claude')) || st3.slice(-200)));
+    await c.call('computer_grant', { revoke: 'all' });
+  }
 
   console.log('\n-- blocked tiers --');
   const allApps = body(await c.call('computer_apps', { include_hidden: true }));

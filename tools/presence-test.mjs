@@ -20,9 +20,9 @@ const check = (n, c, d) => {
   else { fail++; failures.push(n); console.log(`  FAIL ${n}${d ? ' :: ' + d : ''}`); }
 };
 
-function spawnTarget() {
+function spawnTarget(args = []) {
   return new Promise((resolve, reject) => {
-    const p = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', TARGET],
+    const p = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', TARGET, ...args],
       { stdio: ['ignore', 'pipe', 'pipe'] });
     const t = setTimeout(() => reject(new Error('target never reported in')), 15000);
     createInterface({ input: p.stdout }).on('line', (l) => {
@@ -101,9 +101,22 @@ console.log('\n-- cursor courtesy --');
 // covered target - a real click would land on the wrong window). The user may
 // have brought something else forward, so re-assert focus first, in take mode.
 await d.call('focus', { hwnd: win.hwnd, mode: 'take' });
-const shareClick = (await d.call('click', { snapshot_id: snap.snapshot_id, index: btn.i, physical: true, mode: 'share' })).result;
-check('a real click reports its method', shareClick.method === 'physical', JSON.stringify(shareClick));
-check('share mode puts the pointer back after a real click', shareClick.cursor_restored === true, JSON.stringify(shareClick));
+// share mode waits for a gap in the user's own typing, and this suite runs on
+// a machine someone may well be using. Refusing to act then is the feature
+// working, not a failure - so it is reported as such rather than crashing the
+// run. What is being tested here is cursor restoration, which is only
+// observable once the machine is actually free.
+let shareClick = null;
+try {
+  shareClick = (await d.call('click', { snapshot_id: snap.snapshot_id, index: btn.i, physical: true, mode: 'share' })).result;
+} catch (e) {
+  if (e.code !== 'user_busy' && e.code !== 'user_in_window') throw e;
+  console.log(`     (skipped: the user is using the machine right now - ${e.code}, which is share mode behaving correctly)`);
+}
+if (shareClick) {
+  check('a real click reports its method', shareClick.method === 'physical', JSON.stringify(shareClick));
+  check('share mode puts the pointer back after a real click', shareClick.cursor_restored === true, JSON.stringify(shareClick));
+}
 await d.call('focus', { hwnd: win.hwnd, mode: 'take' });
 const takeClick = (await d.call('click', { snapshot_id: snap.snapshot_id, index: btn.i, physical: true, mode: 'take' })).result;
 check('take mode also puts the pointer back (no relocation)', takeClick.cursor_restored === true, JSON.stringify(takeClick));
@@ -138,10 +151,43 @@ console.log('\n-- overlay: showing the user what happened --');
 check('overlay started', d.info.overlay === true, JSON.stringify(d.info));
 
 // It must never be a window Claude can see or target.
+const hostWindows = (list) => list.filter((w) => (w.process || '').toLowerCase().startsWith('axonhost'));
 const listed = (await d.call('list_apps', { include_hidden: true })).result.windows;
 check('overlay never appears in list_apps',
-  !listed.some((w) => (w.process || '').toLowerCase().indexOf('computer-usehost') === 0),
-  listed.filter((w) => (w.process || '').toLowerCase().indexOf('computer-usehost') === 0).map((w) => w.title).join(','));
+  hostWindows(listed).length === 0,
+  hostWindows(listed).map((w) => `${w.process} "${w.title}"`).join(', '));
+
+// A second Claude session draws its own banner, ring and cursor. To this
+// session those are four unexplained windows owned by another process - and
+// without the marker every host puts on its own chrome, they would be listed
+// as things to click.
+{
+  // Give it the slot a second session would really be handed, so it draws the
+  // chrome a second session would really draw.
+  const other = new Driver({ onLog: () => {}, env: { CU_SESSION_SLOT: '1', CU_SESSION_LABEL: 'session 2' } });
+  const otherInfo = await other.start();
+
+  check('this session draws in Claude\'s own colour', d.info.accent === '#D97757', String(d.info.accent));
+  check('a second session gets its own cursor, in its own colour',
+    !!otherInfo.accent && otherInfo.accent !== d.info.accent,
+    `${d.info.accent} vs ${otherInfo.accent}`);
+  check('both sessions have an overlay to draw it with',
+    d.info.overlay === true && otherInfo.overlay === true,
+    `${d.info.overlay} / ${otherInfo.overlay}`);
+  // The colour follows the slot, so it is stable for the life of a session
+  // rather than depending on who happened to act last.
+  const again = (await other.call('session', { slot: 1, label: 'session 2', peers: 1 })).result;
+  check('and that colour does not drift', again.accent === otherInfo.accent,
+    `${otherInfo.accent} -> ${again.accent}`);
+  // Acting is what raises the banner, so this makes its chrome actually visible.
+  await other.call('click', { hwnd: win.hwnd, selector: { name: 'Press Me' }, mode: 'take' });
+  await new Promise((r) => setTimeout(r, 500));
+  const withPeer = (await d.call('list_apps', { include_hidden: true })).result.windows;
+  check("another session's on-screen chrome is invisible to this one",
+    hostWindows(withPeer).length === 0,
+    hostWindows(withPeer).map((w) => `${w.process} "${w.title}"`).join(', '));
+  await other.stop();
+}
 
 // Draw the marker, then click straight through where it sits. If it could
 // intercept a click, or be mistaken for a window covering the target, this
@@ -153,6 +199,45 @@ check('a physical click lands with the marker on screen',
 
 const shot = (await d.call('screenshot', { hwnd: win.hwnd, max_width: 600 })).result;
 check('screenshot succeeds with the marker up', shot.bytes > 500);
+
+console.log('\n-- the banner never eats a click meant for an app --');
+{
+  // The banner is the one piece of chrome that accepts clicks, because Stop has
+  // to be pressable. A window parked underneath it is an ordinary thing to
+  // want to click, and that click must reach the app - not the banner, and
+  // above all not the banner's own Stop button.
+  const top = await spawnTarget(['-CenterTop']);
+  await new Promise((r) => setTimeout(r, 900));
+  const topWin = (await d.call('list_apps')).result.windows.find((w) => w.title === top.title);
+  check('a window at the top of the screen is listed', !!topWin);
+  if (topWin) {
+    await d.call('focus', { hwnd: topWin.hwnd, mode: 'take' });
+    const snapTop = (await d.call('snapshot', { hwnd: topWin.hwnd })).result;
+    const btn = snapTop.nodes.find((n) => n.name === 'Press Me');
+    // Draw the banner first, so it is genuinely on screen over that window.
+    await d.call('click', { hwnd: topWin.hwnd, snapshot_id: snapTop.snapshot_id, index: btn.i, mode: 'take' });
+    await new Promise((r) => setTimeout(r, 150));
+    let err = null;
+    let phys = null;
+    try {
+      phys = (await d.call('click', {
+        hwnd: topWin.hwnd, snapshot_id: snapTop.snapshot_id, index: btn.i,
+        physical: true, mode: 'take',
+      })).result;
+    } catch (e) { err = e; }
+    const after = (await d.call('snapshot', { hwnd: topWin.hwnd })).result;
+    const label = after.nodes.find((n) => n.name && n.name.startsWith('pressed:'));
+    check('a real click under the banner reaches the app', !err && !!label,
+      err ? err.code : JSON.stringify(label && label.name));
+    check('it counted twice, so the physical click landed too',
+      label && label.name === 'pressed:2', JSON.stringify(label && label.name));
+    const st = (await d.call('presence')).result;
+    check('and it never pressed the banner\'s own Stop', st.stop_requested === false);
+    if (phys && phys.banner_stepped_aside) console.log('     (the banner was over the target and stepped aside)');
+    await d.call('close_window', { hwnd: topWin.hwnd, mode: 'take' });
+  }
+  try { top.proc.kill(); } catch {}
+}
 
 console.log('\n-- overlay and presence can each be turned off --');
 for (const [envVar, field] of [['CU_OVERLAY', 'overlay'], ['CU_PRESENCE', 'presence']]) {

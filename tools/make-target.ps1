@@ -2,6 +2,8 @@
 # Computer Use test target. Nothing pre-existing on the machine is ever used for tests.
 # Prints its window title and PID as JSON, then blocks until closed.
 
+param([switch]$CenterTop)
+
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -12,7 +14,17 @@ $form                = New-Object System.Windows.Forms.Form
 $form.Text           = $title
 $form.Size           = New-Object System.Drawing.Size(560, 460)
 $form.StartPosition  = 'Manual'
-$form.Location       = New-Object System.Drawing.Point(120, 120)
+# CenterTop parks the window where Computer Use draws its own banner, so a test
+# can prove a real click near the top of the screen reaches the app underneath
+# instead of being swallowed by that banner.
+if ($CenterTop) {
+    $w = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width
+    # -25 so the first button's centre lands inside the banner's band, not just
+    # below it - the whole point of this position is to sit under the banner.
+    $form.Location = New-Object System.Drawing.Point(([int]($w / 2) - 200), -25)
+} else {
+    $form.Location = New-Object System.Drawing.Point(120, 120)
+}
 $form.TopMost        = $false
 
 $btn                 = New-Object System.Windows.Forms.Button
@@ -78,7 +90,16 @@ $disabled.Enabled    = $false
 $disabled.Location   = New-Object System.Drawing.Point(250, 285)
 $disabled.Size       = New-Object System.Drawing.Size(120, 32)
 
-$form.Controls.AddRange(@($btn, $status, $edit, $check, $combo, $multi, $list, $disabled))
+# A control whose own label says the click has consequences, so the
+# confirmation gate has something real to fire on. It does nothing but count.
+$send                = New-Object System.Windows.Forms.Button
+$send.Name           = 'sendButton'
+$send.Text           = 'Send Payment'
+$send.Location       = New-Object System.Drawing.Point(250, 330)
+$send.Size           = New-Object System.Drawing.Size(140, 32)
+$send.Add_Click({ $script:presses++; $status.Text = "pressed:$($script:presses)" })
+
+$form.Controls.AddRange(@($btn, $status, $edit, $check, $combo, $multi, $list, $disabled, $send))
 
 $form.Add_Shown({
     $form.Activate()
