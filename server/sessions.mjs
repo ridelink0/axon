@@ -263,20 +263,27 @@ export class Sessions {
       this.now() - Number(p.last_at || 0) < withinMs);
   }
 
-  // One line for the model, only when there is something to say.
-  note(hwnd) {
+  // One line for the model, only when there is something new to say: the
+  // first time a peer is seen, when the set of peers changes, and whenever
+  // one has just acted in the same window. Repeating "another session
+  // exists" on every action taught nothing and cost fifty tokens a time.
+  note(hwnd, { always = false } = {}) {
     const peers = this.peers();
-    if (!peers.length) return '';
+    if (!peers.length) { this._noteSig = ''; return ''; }
     const clash = this.conflicts(hwnd);
+    const sig = peers.map((p) => p.pid).sort().join(',');
+    // A window listing is "who is here", so it always says; an action says
+    // it only the first time.
+    if (!always && sig === this._noteSig && !clash.length) return '';
+    this._noteSig = sig;
     const who = peers.map((p) => {
       const what = p.last_op
         ? `${p.last_op}${p.last_title ? ` in "${p.last_title}"` : ''} ${Math.round((this.now() - Number(p.last_at || 0)) / 1000)}s ago`
         : 'no actions yet';
-      if (p.idle) return `${p.label} (pid ${p.pid}, idle): ${what}`;
-      return `${p.label} (pid ${p.pid}): ${what}`;
+      return `${p.label} (pid ${p.pid}${p.idle ? ', idle' : ''}): ${what}`;
     }).join('; ');
-    let s = `[${peers.length} other Claude session${peers.length > 1 ? 's are' : ' is'} using this computer: ${who}. ` +
-            `Input is serialised between sessions, but grants are not shared and neither is intent.]\n`;
+    let s = `[${peers.length} other Claude session${peers.length > 1 ? 's share' : ' shares'} this desktop: ${who}. ` +
+            `Input is serialised; grants and snapshots are not shared.]\n`;
     if (clash.length) {
       s += `[WARNING: ${clash.map((p) => p.label).join(', ')} acted in THIS SAME WINDOW moments ago. ` +
            `Two agents editing one window will corrupt each other's work - say so and check with the user before continuing.]\n`;

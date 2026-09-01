@@ -469,6 +469,7 @@ namespace Axon
                 case "close_window": return OpCloseWindow(a);
                 case "wait_for": return OpWaitFor(a);
                 case "screenshot": return OpScreenshot(a);
+                case "clipboard": return OpClipboard(a);
                 default: throw new AxonError("unknown_op", "Unknown operation '" + op + "'.");
             }
         }
@@ -1012,6 +1013,187 @@ namespace Axon
             }
         }
 
+        // ---- snapshot: one batched fetch, not one call per property ---------
+        //
+        // Every AutomationElement property read is a cross-process call, and the
+        // old walk made about thirty of them per node - a 200-node browser
+        // window took two to five seconds. A CacheRequest with TreeScope.Subtree
+        // asks the provider for every property of every element in one call;
+        // the provider gathers them in-process and marshals the lot back at
+        // once. Measured on the same Opera window: 724ms -> 47ms for the walk
+        // alone, and the pattern-state and text reads that used to follow it are
+        // now free. Elements come back in Full mode, so they are still live
+        // references that can be invoked and typed into later.
+
+        static CacheRequest _snapReq;
+
+        static CacheRequest SnapRequest()
+        {
+            if (_snapReq != null) return _snapReq;
+            CacheRequest cr = new CacheRequest();
+            cr.TreeScope = TreeScope.Subtree;
+            cr.AutomationElementMode = AutomationElementMode.Full;
+            cr.TreeFilter = Automation.ControlViewCondition;
+            cr.Add(AutomationElement.ControlTypeProperty);
+            cr.Add(AutomationElement.NameProperty);
+            cr.Add(AutomationElement.AutomationIdProperty);
+            cr.Add(AutomationElement.BoundingRectangleProperty);
+            cr.Add(AutomationElement.IsEnabledProperty);
+            cr.Add(AutomationElement.IsOffscreenProperty);
+            cr.Add(AutomationElement.HasKeyboardFocusProperty);
+            cr.Add(AutomationElement.IsKeyboardFocusableProperty);
+            cr.Add(AutomationElement.NativeWindowHandleProperty);
+            cr.Add(AutomationElement.IsInvokePatternAvailableProperty);
+            cr.Add(AutomationElement.IsTogglePatternAvailableProperty);
+            cr.Add(AutomationElement.IsValuePatternAvailableProperty);
+            cr.Add(AutomationElement.IsSelectionItemPatternAvailableProperty);
+            cr.Add(AutomationElement.IsExpandCollapsePatternAvailableProperty);
+            cr.Add(AutomationElement.IsScrollPatternAvailableProperty);
+            cr.Add(AutomationElement.IsRangeValuePatternAvailableProperty);
+            cr.Add(AutomationElement.IsTextPatternAvailableProperty);
+            cr.Add(TogglePattern.ToggleStateProperty);
+            cr.Add(ValuePattern.ValueProperty);
+            cr.Add(SelectionItemPattern.IsSelectedProperty);
+            cr.Add(ExpandCollapsePattern.ExpandCollapseStateProperty);
+            cr.Add(RangeValuePattern.ValueProperty);
+            cr.Add(RangeValuePattern.MinimumProperty);
+            cr.Add(RangeValuePattern.MaximumProperty);
+            _snapReq = cr;
+            return cr;
+        }
+
+        // Text that is not text: the object-replacement character a browser
+        // puts in an empty input, zero-width joiners, byte-order marks. Reported
+        // as a name they look like content; stripped they are nothing.
+        static string CleanText(string s)
+        {
+            if (s == null) return null;
+            StringBuilder sb = null;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                bool junk = c == (char)0xFFFC || c == (char)0xFEFF || (c >= (char)0x200B && c <= (char)0x200F) || c == (char)0x2060;
+                if (junk)
+                {
+                    if (sb == null) { sb = new StringBuilder(s.Length); sb.Append(s, 0, i); }
+                    continue;
+                }
+                if (sb != null) sb.Append(c);
+            }
+            string t = (sb != null ? sb.ToString() : s).Trim();
+            return t.Length == 0 ? null : t;
+        }
+
+        static bool CachedBool(AutomationElement el, AutomationProperty p)
+        {
+            try
+            {
+                object o = el.GetCachedPropertyValue(p, true);
+                if (o == null || o == AutomationElement.NotSupported) return false;
+                return Convert.ToBoolean(o);
+            }
+            catch { return false; }
+        }
+
+        static object CachedProp(AutomationElement el, AutomationProperty p)
+        {
+            try
+            {
+                object o = el.GetCachedPropertyValue(p, true);
+                if (o == AutomationElement.NotSupported) return null;
+                return o;
+            }
+            catch { return null; }
+        }
+
+        static int[] CachedRect(AutomationElement el)
+        {
+            try
+            {
+                object o = CachedProp(el, AutomationElement.BoundingRectangleProperty);
+                if (o == null || !(o is System.Windows.Rect)) return null;
+                System.Windows.Rect r = (System.Windows.Rect)o;
+                if (r.IsEmpty || double.IsInfinity(r.X) || double.IsNaN(r.X)) return null;
+                if (r.Width <= 0 || r.Height <= 0) return null;
+                return new int[] { (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height };
+            }
+            catch { return null; }
+        }
+
+        static readonly AutomationProperty[] PatternAvail = new AutomationProperty[]
+        {
+            AutomationElement.IsInvokePatternAvailableProperty,
+            AutomationElement.IsTogglePatternAvailableProperty,
+            AutomationElement.IsValuePatternAvailableProperty,
+            AutomationElement.IsSelectionItemPatternAvailableProperty,
+            AutomationElement.IsExpandCollapsePatternAvailableProperty,
+            AutomationElement.IsScrollPatternAvailableProperty,
+            AutomationElement.IsRangeValuePatternAvailableProperty,
+            AutomationElement.IsTextPatternAvailableProperty,
+        };
+        static readonly string[] PatternNames = new string[]
+        { "Invoke", "Toggle", "Value", "SelectionItem", "ExpandCollapse", "Scroll", "RangeValue", "Text" };
+
+        static List<string> CachedPatterns(AutomationElement el)
+        {
+            List<string> names = new List<string>();
+            for (int i = 0; i < PatternAvail.Length; i++)
+                if (CachedBool(el, PatternAvail[i])) names.Add(PatternNames[i]);
+            return names;
+        }
+
+        static string CachedRole(AutomationElement el)
+        {
+            try
+            {
+                object o = CachedProp(el, AutomationElement.ControlTypeProperty);
+                ControlType ct = o as ControlType;
+                if (ct == null) return "Unknown";
+                string n = ct.ProgrammaticName;
+                if (n != null && n.StartsWith("ControlType.")) n = n.Substring("ControlType.".Length);
+                return n;
+            }
+            catch { return "Unknown"; }
+        }
+
+        // The whole subtree in one call, on a worker so a provider that never
+        // answers cannot wedge the host. Null when it did not arrive in time.
+        static AutomationElement FetchSubtree(AutomationElement win, int budgetMs)
+        {
+            AutomationElement got = null;
+            Exception failure = null;
+            using (System.Threading.ManualResetEventSlim done = new System.Threading.ManualResetEventSlim(false))
+            {
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { got = win.GetUpdatedCache(SnapRequest()); }
+                    catch (Exception ex) { failure = ex; }
+                    finally { try { done.Set(); } catch { } }
+                });
+                if (!done.Wait(budgetMs)) return null;
+            }
+            if (failure != null) return null;
+            return got;
+        }
+
+        static bool HasDocument(AutomationElement cached, int limit)
+        {
+            Stack<AutomationElement> st = new Stack<AutomationElement>();
+            st.Push(cached);
+            int n = 0;
+            while (st.Count > 0 && n < limit)
+            {
+                AutomationElement el = st.Pop();
+                n++;
+                if (CachedRole(el) == "Document") return true;
+                AutomationElementCollection kids = null;
+                try { kids = el.CachedChildren; } catch { }
+                if (kids == null) continue;
+                foreach (AutomationElement k in kids) st.Push(k);
+            }
+            return false;
+        }
+
         static object OpSnapshot(Dictionary<string, object> a)
         {
             AutomationElement win = RequireWindow(a);
@@ -1023,22 +1205,21 @@ namespace Axon
             // the tight one. An explicit max_depth / max_nodes always wins.
             bool hasDepth = Get(a, "max_depth") != null;
             bool hasNodes = Get(a, "max_nodes") != null;
-            int maxNodes = hasNodes ? Int(Get(a, "max_nodes"), 400) : (web ? 1200 : 400);
+            int maxNodes = hasNodes ? Int(Get(a, "max_nodes"), 400) : (web ? 1500 : 400);
             int maxDepth = hasDepth ? Int(Get(a, "max_depth"), 14) : (web ? 45 : 14);
             bool interactiveOnly = Bool(Get(a, "interactive_only"), false);
+
+            System.Diagnostics.Stopwatch walkClock = System.Diagnostics.Stopwatch.StartNew();
+            int walkBudgetMs = EnvInt("CU_SNAPSHOT_MS", 8000);
 
             if (web)
             {
                 try
                 {
-                    IntPtr h = new IntPtr(win.Current.NativeWindowHandle);
                     // Ask the browser to expose its page to accessibility (it
-                    // keeps it off until an assistive-tech client asks), then let
-                    // the tree build before reading.
+                    // keeps it off until an assistive-tech client asks).
+                    IntPtr h = new IntPtr(win.Current.NativeWindowHandle);
                     EnableWebAccessibility(h);
-                    System.Threading.Thread.Sleep(350);
-                    AutomationElement refreshed = ResolveWindow(a);
-                    if (refreshed != null) win = refreshed;
                 }
                 catch { }
             }
@@ -1057,84 +1238,211 @@ namespace Axon
             }
             catch { }
 
-            TreeWalker walker = TreeWalker.ControlViewWalker;
+            // Fetch. A browser that has only just been asked to build its page
+            // tree answers with the toolbar alone for a few hundred
+            // milliseconds; a read with no Document in it is re-taken until one
+            // appears or a second and a half has gone, so the first read of a
+            // page is as complete as the second.
+            AutomationElement cached = null;
+            int webWaitMs = 0;
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                int remaining = walkBudgetMs - (int)walkClock.ElapsedMilliseconds;
+                // A batched fetch of an ordinary window takes well under a
+                // quarter of a second, so even a caller with a tiny budget is
+                // given that much: a whole tree in 120ms beats a partial one
+                // walked slowly.
+                if (attempt > 0 && remaining < 200) break;
+                cached = FetchSubtree(win, Math.Max(remaining, 250));
+                if (cached == null) break;
+                if (!web) break;
+                if (HasDocument(cached, 4000)) break;
+                if (walkClock.ElapsedMilliseconds > 1500) break;
+                System.Threading.Thread.Sleep(120);
+                webWaitMs += 120;
+            }
+
             List<AutomationElement> elements = new List<AutomationElement>();
             List<object> nodes = new List<object>();
             bool truncated = false;
-
-            // A node cap bounds the SIZE of a tree, not the TIME it takes to read
-            // one. An Electron window's provider can spend tens of milliseconds
-            // per node, and a thousand of those runs past the caller's timeout -
-            // at which point the host is still walking, the call has already
-            // failed, and the session is wedged for the rest of it. So the walk
-            // has a wall clock too: a partial tree that arrives beats a perfect
-            // one that does not.
-            System.Diagnostics.Stopwatch walkClock = System.Diagnostics.Stopwatch.StartNew();
-            int walkBudgetMs = EnvInt("CU_SNAPSHOT_MS", 8000);
             bool ranOutOfTime = false;
+            bool cachedPath = cached != null;
+            int liveTextReads = 0;
 
-            // Iterative walk keeps ordering stable and cannot blow the stack on
-            // a deep tree such as browser content.
-            Stack<Frame> stack = new Stack<Frame>();
-            stack.Push(new Frame(win, 0));
-
-            while (stack.Count > 0)
+            if (cachedPath)
             {
-                if (nodes.Count >= maxNodes) { truncated = true; break; }
-                if (walkClock.ElapsedMilliseconds > walkBudgetMs)
+                // Everything below is in-memory: no cross-process calls except
+                // the bounded TextPattern reads for documents and editors.
+                Stack<Frame> stack = new Stack<Frame>();
+                stack.Push(new Frame(cached, 0));
+                while (stack.Count > 0)
                 {
-                    truncated = true;
-                    ranOutOfTime = true;
-                    break;
-                }
-                Frame f = stack.Pop();
-                AutomationElement el = f.El;
+                    if (nodes.Count >= maxNodes) { truncated = true; break; }
+                    Frame f = stack.Pop();
+                    AutomationElement el = f.El;
 
-                int[] rect = RectOf(el);
-                List<string> patterns = PatternsOf(el);
-                bool interactive = false;
-                foreach (string ip in InteractivePatterns) { if (patterns.Contains(ip)) { interactive = true; break; } }
+                    int[] rect = CachedRect(el);
+                    List<string> patterns = CachedPatterns(el);
+                    bool interactive = false;
+                    foreach (string ip in InteractivePatterns) { if (patterns.Contains(ip)) { interactive = true; break; } }
 
-                bool include = true;
-                if (interactiveOnly && f.Depth > 0 && !interactive) include = false;
-                if (rect == null && f.Depth > 0 && !offDesktop) include = false;
+                    bool include = true;
+                    if (interactiveOnly && f.Depth > 0 && !interactive) include = false;
+                    if (rect == null && f.Depth > 0 && !offDesktop) include = false;
 
-                if (include)
-                {
-                    Dictionary<string, object> node = new Dictionary<string, object>();
-                    node["i"] = nodes.Count;
-                    node["role"] = RoleOf(el);
-                    node["depth"] = f.Depth;
-                    string nm = NameOf(el);
-                    if (!string.IsNullOrEmpty(nm)) node["name"] = nm;
-                    string aid = AidOf(el);
-                    if (!string.IsNullOrEmpty(aid)) node["aid"] = aid;
-                    if (rect != null) node["rect"] = rect;
-                    if (patterns.Count > 0) node["patterns"] = patterns;
-                    string txt = TextOf(el, patterns);
-                    if (txt != null) node["text"] = txt;
-                    Dictionary<string, object> st = StateOf(el, patterns);
-                    if (st != null) node["state"] = st;
-                    nodes.Add(node);
-                    elements.Add(el);
-                }
-
-                if (f.Depth < maxDepth)
-                {
-                    List<AutomationElement> kids = new List<AutomationElement>();
-                    try
+                    if (include)
                     {
-                        AutomationElement k = walker.GetFirstChild(el);
-                        int guard = 0;
-                        while (k != null && guard < 500)
+                        Dictionary<string, object> node = new Dictionary<string, object>();
+                        string role = CachedRole(el);
+                        node["i"] = nodes.Count;
+                        node["role"] = role;
+                        node["depth"] = f.Depth;
+                        string nm = CleanText(CachedProp(el, AutomationElement.NameProperty) as string);
+                        if (nm != null) node["name"] = nm;
+                        string aid = CachedProp(el, AutomationElement.AutomationIdProperty) as string;
+                        if (!string.IsNullOrEmpty(aid)) node["aid"] = aid;
+                        if (rect != null) node["rect"] = rect;
+                        if (patterns.Count > 0) node["patterns"] = patterns;
+
+                        // Text: the value pattern is cached and free. The text
+                        // pattern is a live call, so it is spent only where it
+                        // can say something the name does not - a document or
+                        // an editor - and only a bounded number of times.
+                        string txt = null;
+                        if (patterns.Contains("Value")) txt = CleanText(CachedProp(el, ValuePattern.ValueProperty) as string);
+                        if (txt == null && patterns.Contains("Text") && (role == "Document" || role == "Edit") && liveTextReads < 24)
                         {
-                            kids.Add(k);
-                            k = walker.GetNextSibling(k);
-                            guard++;
+                            liveTextReads++;
+                            try
+                            {
+                                TextPattern tp = el.GetCurrentPattern(TextPattern.Pattern) as TextPattern;
+                                if (tp != null) txt = CleanText(tp.DocumentRange.GetText(4000));
+                            }
+                            catch { }
+                        }
+                        if (txt != null)
+                        {
+                            txt = txt.Replace("\r\n", "\n");
+                            if (txt.Length > 4000) txt = txt.Substring(0, 4000) + "...[truncated]";
+                            node["text"] = txt;
+                        }
+
+                        Dictionary<string, object> st = new Dictionary<string, object>();
+                        if (!CachedBool(el, AutomationElement.IsEnabledProperty)) st["disabled"] = true;
+                        if (CachedBool(el, AutomationElement.IsOffscreenProperty)) st["offscreen"] = true;
+                        if (CachedBool(el, AutomationElement.IsKeyboardFocusableProperty)) st["focusable"] = true;
+                        if (CachedBool(el, AutomationElement.HasKeyboardFocusProperty)) st["focused"] = true;
+                        if (patterns.Contains("Toggle"))
+                        {
+                            object o = CachedProp(el, TogglePattern.ToggleStateProperty);
+                            if (o != null) st["toggle"] = o.ToString();
+                        }
+                        if (patterns.Contains("SelectionItem"))
+                        {
+                            object o = CachedProp(el, SelectionItemPattern.IsSelectedProperty);
+                            if (o != null) st["selected"] = Convert.ToBoolean(o);
+                        }
+                        if (patterns.Contains("ExpandCollapse"))
+                        {
+                            object o = CachedProp(el, ExpandCollapsePattern.ExpandCollapseStateProperty);
+                            if (o != null) st["expand"] = o.ToString();
+                        }
+                        if (patterns.Contains("RangeValue"))
+                        {
+                            object v = CachedProp(el, RangeValuePattern.ValueProperty);
+                            object mn = CachedProp(el, RangeValuePattern.MinimumProperty);
+                            object mx = CachedProp(el, RangeValuePattern.MaximumProperty);
+                            if (v != null) st["value"] = v;
+                            if (mn != null) st["min"] = mn;
+                            if (mx != null) st["max"] = mx;
+                        }
+                        if (st.Count > 0) node["state"] = st;
+                        nodes.Add(node);
+                        elements.Add(el);
+                    }
+
+                    if (f.Depth < maxDepth)
+                    {
+                        AutomationElementCollection kids = null;
+                        try { kids = el.CachedChildren; } catch { }
+                        if (kids != null)
+                        {
+                            List<AutomationElement> ks = new List<AutomationElement>(kids.Count);
+                            foreach (AutomationElement k in kids) ks.Add(k);
+                            for (int j = ks.Count - 1; j >= 0; j--) stack.Push(new Frame(ks[j], f.Depth + 1));
                         }
                     }
-                    catch { }
-                    for (int j = kids.Count - 1; j >= 0; j--) stack.Push(new Frame(kids[j], f.Depth + 1));
+                }
+            }
+            else
+            {
+                // The provider would not answer a batched request in time (or at
+                // all). Fall back to the one-call-per-property walk, which can
+                // at least stop partway and hand back what it has.
+                TreeWalker walker = TreeWalker.ControlViewWalker;
+                Stack<Frame> stack = new Stack<Frame>();
+                stack.Push(new Frame(win, 0));
+
+                while (stack.Count > 0)
+                {
+                    if (nodes.Count >= maxNodes) { truncated = true; break; }
+                    // The root always goes in, so a tight budget still hands
+                    // back a tree rather than nothing.
+                    if (nodes.Count > 0 && walkClock.ElapsedMilliseconds > walkBudgetMs)
+                    {
+                        truncated = true;
+                        ranOutOfTime = true;
+                        break;
+                    }
+                    Frame f = stack.Pop();
+                    AutomationElement el = f.El;
+
+                    int[] rect = RectOf(el);
+                    List<string> patterns = PatternsOf(el);
+                    bool interactive = false;
+                    foreach (string ip in InteractivePatterns) { if (patterns.Contains(ip)) { interactive = true; break; } }
+
+                    bool include = true;
+                    if (interactiveOnly && f.Depth > 0 && !interactive) include = false;
+                    if (rect == null && f.Depth > 0 && !offDesktop) include = false;
+
+                    if (include)
+                    {
+                        Dictionary<string, object> node = new Dictionary<string, object>();
+                        node["i"] = nodes.Count;
+                        node["role"] = RoleOf(el);
+                        node["depth"] = f.Depth;
+                        string nm = CleanText(NameOf(el));
+                        if (nm != null) node["name"] = nm;
+                        string aid = AidOf(el);
+                        if (!string.IsNullOrEmpty(aid)) node["aid"] = aid;
+                        if (rect != null) node["rect"] = rect;
+                        if (patterns.Count > 0) node["patterns"] = patterns;
+                        string txt = CleanText(TextOf(el, patterns));
+                        if (txt != null) node["text"] = txt;
+                        Dictionary<string, object> st = StateOf(el, patterns);
+                        if (st != null) node["state"] = st;
+                        nodes.Add(node);
+                        elements.Add(el);
+                    }
+
+                    if (f.Depth < maxDepth)
+                    {
+                        List<AutomationElement> kids = new List<AutomationElement>();
+                        try
+                        {
+                            AutomationElement k = walker.GetFirstChild(el);
+                            int guard = 0;
+                            while (k != null && guard < 500)
+                            {
+                                kids.Add(k);
+                                k = walker.GetNextSibling(k);
+                                guard++;
+                            }
+                        }
+                        catch { }
+                        for (int j = kids.Count - 1; j >= 0; j--) stack.Push(new Frame(kids[j], f.Depth + 1));
+                    }
                 }
             }
 
@@ -1171,8 +1479,11 @@ namespace Axon
             res["rect"] = RectOf(win);
             res["node_count"] = nodes.Count;
             res["truncated"] = truncated;
+            res["walk_ms"] = walkClock.ElapsedMilliseconds;
+            res["batched"] = cachedPath;
             if (ranOutOfTime) res["time_budget_ms"] = walkBudgetMs;
-            if (web) res["web_accessibility_enabled"] = true;
+            if (web) res["web"] = true;
+            if (webWaitMs > 0) res["web_wait_ms"] = webWaitMs;
             if (offDesktop) res["other_desktop"] = true;
             res["nodes"] = nodes;
             return res;
@@ -1947,8 +2258,19 @@ namespace Axon
                         try { before = vp.Current.Value; } catch { }
                         Trace(el, "type", HwndArg(a));
                         vp.SetValue(text);
+                        // A browser's accessibility tree updates a beat after
+                        // the page does, so a read-back straight after the
+                        // write can still show the old value. Poll briefly
+                        // before concluding the setter was ignored - otherwise
+                        // a write that worked is followed by keystrokes into a
+                        // window the user may be looking at.
                         string after = null;
-                        try { after = vp.Current.Value; } catch { }
+                        for (int tries = 0; tries < 12; tries++)
+                        {
+                            try { after = vp.Current.Value; } catch { }
+                            if (after == text || after != before) break;
+                            System.Threading.Thread.Sleep(50);
+                        }
 
                         bool exact = after == text;
                         // Some providers normalise what they store - a date, a
@@ -2325,6 +2647,41 @@ namespace Axon
             res["source"] = new int[] { region.X, region.Y, region.Width, region.Height };
             res["bytes"] = bytes.Length;
             res["data"] = Convert.ToBase64String(bytes);
+            return res;
+        }
+
+        // The clipboard is a COM object that wants a single-threaded apartment,
+        // which the host's main thread is not, so each access runs on its own
+        // STA thread with a short deadline - another app can hold the clipboard
+        // open and that must not wedge the host.
+        static object OpClipboard(Dictionary<string, object> a)
+        {
+            string set = Get(a, "text") == null ? null : Str(Get(a, "text"));
+            string got = null;
+            Exception failure = null;
+            System.Threading.Thread t = new System.Threading.Thread(delegate()
+            {
+                try
+                {
+                    if (set != null)
+                    {
+                        if (set.Length == 0) Clipboard.Clear();
+                        else Clipboard.SetText(set);
+                    }
+                    else if (Clipboard.ContainsText()) got = Clipboard.GetText();
+                }
+                catch (Exception ex) { failure = ex; }
+            });
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
+            if (!t.Join(3000))
+                throw new AxonError("clipboard_busy", "The clipboard did not respond within 3s.",
+                    "Another application is holding it open. Retry in a moment.");
+            if (failure != null)
+                throw new AxonError("clipboard_error", failure.Message, null);
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            if (set != null) { res["set"] = true; res["length"] = set.Length; }
+            else { res["has_text"] = got != null; if (got != null) res["text"] = got; }
             return res;
         }
 

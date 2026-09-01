@@ -13,7 +13,7 @@ import { profileHint } from './profiles.mjs';
 import { Sessions, LeaseBusy } from './sessions.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-const SERVER_INFO = { name: 'computer-use', version: '0.1.0' };
+const SERVER_INFO = { name: 'computer-use', version: '0.2.0' };
 
 // Other Claude Code sessions driving this same desktop. Registered before the
 // host starts, so the banner knows which slot it owns and never lands on top of
@@ -57,9 +57,8 @@ async function presence({ fresh = false } = {}) {
 function presenceNote(p) {
   if (!p || !p.monitoring) return '';
   if (!p.user_active) return '';
-  const what = p.last_input === 'keyboard' ? 'typing' : 'moving the mouse';
-  return `[user present: ${what} ${p.idle_ms}ms ago. Reading and pattern-based actions are unaffected; anything needing the cursor or foreground will wait for a gap.]
-`;
+  const what = p.last_input === 'keyboard' ? 'typing' : 'mouse';
+  return `[user active: ${what} ${p.idle_ms}ms ago]\n`;
 }
 
 // The banner has to know how many Claudes are on this desktop, because it only
@@ -120,11 +119,12 @@ const TOOLS = [
   },
   {
     name: 'computer_snapshot',
-    description: 'Read a window as an indexed semantic tree (roles, names, ids, states, text including text scrolled out of view). Default way to see a window; ~15x cheaper than a screenshot.',
+    description: 'Read a window as an indexed semantic tree (roles, names, ids, states, text including text scrolled out of view). Default way to see a window; ~15x cheaper than a screenshot. Browsers: shows the page, its URL and tabs.',
     inputSchema: { type: 'object', properties: {
       hwnd: int, title: str,
       interactive_only: { type: 'boolean', description: 'Actionable elements only. Smaller.' },
       max_nodes: int, max_depth: int,
+      chrome: { type: 'boolean', description: 'Browsers: also list toolbar and sidebar controls.' },
       text_limit: { type: 'integer', description: 'Chars of element text to show. Default 200.' },
       with_rects: { type: 'boolean', description: 'Include bounding boxes. Only needed for point targeting.' },
       with_image: { type: 'boolean', description: 'Hybrid read: tree PLUS a picture of the same window, the way Codex sees. For visual/canvas checks. Costs ~15x the tree.' },
@@ -183,6 +183,11 @@ const TOOLS = [
     name: 'computer_close_window',
     description: 'Ask one window to close, as clicking its X would, so the app can still prompt to save. Computer Use cannot kill processes.',
     inputSchema: { type: 'object', properties: { hwnd: int, title: str } },
+  },
+  {
+    name: 'computer_clipboard',
+    description: 'Read the clipboard text, or set it when text is given.',
+    inputSchema: { type: 'object', properties: { text: str } },
   },
   {
     name: 'computer_status',
@@ -360,7 +365,7 @@ const handlers = {
     const wins = await listWindows({ includeHidden: !!args.include_hidden, fresh: true });
     const visible = wins.filter((w) => !policy.isSelf(w))
       .filter((w) => DESKTOP_SCOPE !== 'current' || !w.other_desktop);
-    return text(sessions.note(null) + renderApps(visible, policy, classify));
+    return text(sessions.note(null, { always: true }) + renderApps(visible, policy, classify));
   },
 
   async computer_status() {
@@ -438,23 +443,26 @@ const handlers = {
     const elsewhere = offDesktopCheck(win);
     if (elsewhere) return elsewhere;
 
-    const { result } = await driver.call('snapshot', {
+    const call = await driver.call('snapshot', {
       hwnd: Number(win.hwnd),
       interactive_only: !!args.interactive_only,
       max_nodes: args.max_nodes,
       max_depth: args.max_depth,
     });
+    const { result } = call;
     budget.snapshots++;
     lastSnapshotId = result.snapshot_id;
     trackSnapshot(result.snapshot_id, Number(win.hwnd), result.nodes);
 
+    // App notes ride on the grant, which every acting task takes exactly
+    // once; repeating them on every read cost more than the read.
     let body = presenceNote(await presence()) + injectionBanner(win) + renderSnapshot(result, {
       textLimit: args.text_limit,
       withRects: !!args.with_rects,
       lean: !!args.interactive_only,
+      chrome: !!args.chrome,
+      ms: call.ms,
     });
-    const hint = profileHint(win);
-    if (hint) body += `\n\napp notes: ${hint}`;
 
     const content = [{ type: 'text', text: body }];
     if (args.with_image) {
@@ -537,8 +545,9 @@ const handlers = {
 
   async computer_type(args) {
     if (args.replace) {
-      return act('set_value', args, (r) =>
-        `set field via ${r.method}${r.value !== undefined ? `, now ${JSON.stringify(r.value)}` : ''}.`);
+      // The value after the write arrives in the Now: suffix; saying it twice
+      // was the most common duplicate line in a session.
+      return act('set_value', args, (r) => `set field via ${r.method}${r.normalised_by_app ? ' (app normalised it)' : ''}.`);
     }
     return act('type', args, (r) => `typed ${r.typed} characters.`);
   },
@@ -554,6 +563,17 @@ const handlers = {
       timeout_ms: args.timeout_ms,
     }, { timeoutMs: (args.timeout_ms || 5000) + 5000 });
     return text(`found ${result.role} "${result.name}" after ${result.waited_ms}ms.`);
+  },
+
+  // The clipboard is how text leaves an app that will not expose it any other
+  // way - ctrl+c in a canvas editor, a terminal selection - and how a long
+  // paste goes in without a thousand keystrokes. Reading it needs no grant.
+  async computer_clipboard(args) {
+    const { result } = await driver.call('clipboard', { text: args.text });
+    if (args.text != null) return text(`clipboard set (${result.length} chars).`);
+    if (!result.has_text) return text('clipboard has no text.');
+    const t = String(result.text);
+    return text(`clipboard (${t.length} chars): ${JSON.stringify(t.length > 4000 ? t.slice(0, 4000) + '…' : t)}`);
   },
 
   async computer_close_window(args) {
@@ -623,6 +643,7 @@ async function act(op, args, describe) {
   });
 
   let out = sessions.note(Number(win.hwnd)) + describe(result);
+  if (check.autoGranted) out += ` (input auto-granted: "${check.autoGranted}" is on your always-allowed list)`;
   const named = targetName(args);
   if (named && args.confirmed === true) out += ` (confirmed consequential action: "${named}")`;
   if (call.waited_for_session_ms) {

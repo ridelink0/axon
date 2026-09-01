@@ -179,9 +179,28 @@ in the plugin settings if you would rather it did not.
 |---|---:|
 | Reading a window as a tree | **~478** |
 | The same window as a screenshot | **~10,719** |
+| A live web page in Opera, read as a tree (0.2.0) | **~500** |
 
 **Twenty-two times.** Run `node tools/mcp-test.mjs`; it prints this at the end
 of every run, on your machine, with your windows.
+
+And it is fast. 0.1.0 read a window one property at a time - about thirty
+cross-process calls per element, which on a 200-element browser window took
+two to five seconds. 0.2.0 asks the provider for the whole subtree in one
+batched request and gets every property back at once:
+
+| the same Opera window, 143 elements | 0.1.0 | 0.2.0 |
+|---|---:|---:|
+| snapshot | 1,700-5,500 ms | **110-250 ms** |
+| tokens in the result | ~2,000 | **~500** |
+
+The token cut is the renderer saying less: in a browser it shows the page, the
+URL and the tabs and hides the sixty-odd toolbar and sidebar controls (pass
+`chrome: true` to see them); a Button no longer carries an `[Invoke]` tag,
+because a button that can be pressed is just a button; links show their target
+inline, shortened when it stays on the same site; indentation follows the
+elements actually shown rather than twenty levels of wrapper divs; and the notes
+about an app ride on the grant instead of on every read.
 
 And the tree is not just cheaper, it is better:
 
@@ -221,7 +240,14 @@ computer_snapshot { hwnd }                   read it, every element gets an inde
 computer_grant { hwnd }                      needed to act, never to read
 computer_click { index: 12 }
 computer_type { index: 5, text: "...", replace: true }
+computer_clipboard                           read it; { text } sets it
 ```
+
+In a browser the snapshot is the page: its URL in the header, the tabs, and
+every link, button and field by name. `computer_type { replace: true }` on a
+web field writes through the value pattern and the page's own `input` handlers
+fire - a search box filled that way shows its results - with no keystrokes and
+no need for the window to be in front.
 
 Every acting tool takes a `mode`:
 
@@ -267,8 +293,22 @@ result says `exclusive_unavailable`. Escape releases it regardless. It is
 opt-in and never the default, precisely because a locked-out user cannot reach
 the Stop button — Escape is why it is safe to offer at all.
 
-Twelve tools, about **1,580 tokens** of always-on cost. One screenshot you did
-not take pays for that eight times over.
+Thirteen tools, about **1,650 tokens** of always-on cost. One screenshot you did
+not take pays for that six times over.
+
+### Clipboard
+
+`computer_clipboard` reads the clipboard text, or sets it when given `text`.
+That is how text gets out of an app that will not expose it any other way -
+select, `ctrl+c`, read - and how a long paste goes in without a thousand
+keystrokes. Codex has it; now so does this.
+
+### Always-allowed apps
+
+Codex has `always_allowed_app_ids`; this has **Always-allowed apps** in the
+plugin settings. An app on that list is granted on first use instead of
+refused, and the result says so. Blocked and shell tiers stay ungrantable
+whatever the list says.
 
 ## What it will not do
 

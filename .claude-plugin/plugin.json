@@ -1,7 +1,7 @@
 {
   "name": "computer-use",
   "displayName": "Better Computer Use",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex-style computer use for Claude Code. Drives Windows and macOS apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs about 20x fewer tokens. Knows your input from its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
   "author": {
     "name": "ridelink0",
@@ -32,6 +32,12 @@
       "type": "string",
       "title": "Additional blocked apps",
       "description": "Comma-separated process names Computer Use must never read or drive, on top of its built-in blocklist. Example: myvault,internal-admin",
+      "required": false
+    },
+    "always_allowed_apps": {
+      "type": "string",
+      "title": "Always-allowed apps",
+      "description": "Comma-separated process names Computer Use may drive without a per-session grant, like Codex always_allowed_app_ids. Example: notepad,mspaint. Blocked and shell tiers stay ungrantable.",
       "required": false
     },
     "coexist_mode": {

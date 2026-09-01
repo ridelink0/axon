@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Codex-style computer use for Claude Code",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
@@ -14,7 +14,7 @@
       "displayName": "Better Computer Use",
       "source": "./",
       "description": "Codex-style computer use for Claude Code. Drives Windows and macOS apps through the accessibility tree instead of screenshots, so it targets exactly, survives display scaling, and costs about 20x fewer tokens. Knows your input from its own, so you can keep working on the same desktop while it works. WARNING: controls your real computer - read the README.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "ridelink0",
         "url": "https://github.com/ridelink0"

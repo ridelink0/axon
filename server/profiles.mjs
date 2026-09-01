@@ -25,12 +25,10 @@ const PROFILES = [
   },
   {
     match: ['chrome', 'msedge', 'brave', 'vivaldi', 'opera', 'firefox'],
-    hint: 'Page content lives under a Document element and can be thousands of nodes - snapshot with interactive_only, or the tree will truncate. '
-        + 'TO CHANGE THE URL, do exactly this: computer_key ctrl+l, then computer_type with the URL and NO target and NO replace, then computer_key enter. '
-        + 'That path always works. Do NOT try computer_type replace:true on the address bar: browsers expose the omnibox twice, and the outer one '
-        + '(named "Address bar" or "Address and search bar") is a container that refuses both a value and the focus - it returns focus_failed no matter how many times you focus the window. '
-        + 'The inner "Address field" does accept a value, but you still need enter afterwards, so the keyboard path is fewer steps and never picks the wrong one.',
-    keys: { omnibox: 'ctrl+l', 'new tab': 'ctrl+t', find: 'ctrl+f', reload: 'f5' },
+    hint: 'To open a URL: computer_key ctrl+l, computer_type the URL with no target and no replace, computer_key enter. '
+        + 'Never replace:true on the address bar - it is a container that refuses values and focus. '
+        + 'Snapshots show the page; pass chrome:true to see toolbar and sidebar buttons. Big pages: interactive_only.',
+    keys: { 'new tab': 'ctrl+t', find: 'ctrl+f', reload: 'f5', back: 'alt+left' },
   },
   {
     match: ['winword', 'excel', 'powerpnt'],

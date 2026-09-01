@@ -2,37 +2,86 @@
 //
 // This layer is where the token win is banked. The host returns verbose JSON
 // because it is cheap to produce and easy to test; only the rendered form
-// crosses into the context window.
+// crosses into the context window. Everything here is about saying less:
+// a line per element, nothing a role already implies, nothing that repeats,
+// and in a browser, the page rather than the browser.
 
 const ACTIONABLE = new Set(['Invoke', 'Toggle', 'Value', 'SelectionItem', 'ExpandCollapse', 'Scroll', 'RangeValue']);
+
+// Patterns a role already implies. A Button that can be invoked is just a
+// button; printing [Invoke] after every one of them costs tokens and says
+// nothing. Only a pattern a role does NOT imply is worth a tag - a Group that
+// invokes, a Text that toggles.
+const IMPLIED = {
+  Button: ['Invoke', 'Toggle', 'ExpandCollapse'],
+  Hyperlink: ['Invoke', 'Value'],
+  MenuItem: ['Invoke', 'ExpandCollapse', 'Toggle', 'SelectionItem'],
+  TabItem: ['SelectionItem', 'Invoke'],
+  ListItem: ['SelectionItem', 'Invoke', 'Toggle'],
+  TreeItem: ['SelectionItem', 'ExpandCollapse', 'Invoke', 'Toggle'],
+  DataItem: ['SelectionItem', 'Invoke'],
+  HeaderItem: ['Invoke'],
+  CheckBox: ['Toggle', 'Invoke'],
+  RadioButton: ['SelectionItem', 'Invoke'],
+  Edit: ['Value'],
+  ComboBox: ['Value', 'ExpandCollapse', 'SelectionItem'],
+  Document: ['Value', 'Scroll'],
+  SplitButton: ['Invoke', 'ExpandCollapse'],
+  Slider: ['RangeValue', 'Value'],
+  Spinner: ['RangeValue', 'Value'],
+  ScrollBar: ['RangeValue'],
+  ProgressBar: ['RangeValue', 'Value'],
+  List: ['Scroll'], Tree: ['Scroll'], DataGrid: ['Scroll'], Table: ['Scroll'],
+  Pane: ['Scroll'], Window: ['Scroll'],
+};
 
 function rect(r) {
   if (!r) return '';
   return ` (${r[0]},${r[1]} ${r[2]}x${r[3]})`;
 }
 
-function oneLine(s, max) {
-  if (s == null) return '';
-  const flat = String(s).replace(/\s+/g, ' ').trim();
-  if (flat.length <= max) return flat;
-  return flat.slice(0, max - 1) + '…';
+function flat(s) {
+  return s == null ? '' : String(s).replace(/\s+/g, ' ').trim();
 }
 
-// Roles that carry no meaning on their own. One of these with no name, no id,
-// no text and nothing to act on is pure layout scaffolding, and printing it
-// costs tokens for nothing.
-const STRUCTURAL = new Set(['Pane', 'Group', 'Custom', 'Separator', 'TitleBar', 'Thumb', 'Header']);
+function oneLine(s, max) {
+  const f = flat(s);
+  if (f.length <= max) return f;
+  return f.slice(0, max - 1) + '…';
+}
 
 // Long text is shown as head plus tail rather than a plain truncation, so the
 // end of a scrolled-away document stays visible - that content is the whole
 // reason for reading the tree instead of taking a picture - and the character
 // count tells the model when it is worth asking for more.
 function preview(s, limit) {
-  const flat = String(s).replace(/\s+/g, ' ').trim();
-  if (flat.length <= limit) return JSON.stringify(flat);
+  const f = flat(s);
+  if (f.length <= limit) return JSON.stringify(f);
   const head = Math.max(40, Math.floor(limit * 0.6));
   const tail = Math.max(20, limit - head);
-  return `${JSON.stringify(flat.slice(0, head))} … ${JSON.stringify(flat.slice(-tail))} [${flat.length} chars]`;
+  return `${JSON.stringify(f.slice(0, head))} … ${JSON.stringify(f.slice(-tail))} [${f.length} chars]`;
+}
+
+// A Text node whose whole content is one separator glyph is layout, not
+// content: the dots between footer links, the pipes in a breadcrumb.
+const SEPARATOR = /^[\s·•|\-–—,:;/\\*]+$/;
+
+const URLISH = /^(https?:\/\/|mailto:|tel:|file:)/i;
+
+function pageHost(url) {
+  try { return new URL(url).host; } catch { return null; }
+}
+
+// A link on the same site is shown as its path; a link elsewhere in full.
+function shortHref(href, host) {
+  try {
+    const u = new URL(href);
+    if (host && u.host === host) {
+      const p = u.pathname + u.search + u.hash;
+      return p === '/' ? '/' : p;
+    }
+    return href;
+  } catch { return href; }
 }
 
 // Past this many characters a read is worth a sentence about how to make the
@@ -40,25 +89,70 @@ function preview(s, limit) {
 // enough that a conversation full of them is what fills a context window.
 const CHATTY = 12000;
 
-export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean = false } = {}) {
-  const lines = [];
-  const head = [`${snap.snapshot_id} "${snap.title || '(untitled)'}" hwnd=${snap.hwnd}`];
+// In a browser, the page is what matters. Everything outside a Document -
+// the tab strip, toolbar, bookmarks bar, sidebar - is the browser's own UI,
+// and there are sixty-odd controls of it on every read. Only the tabs and the
+// address field earn their place by default; `chrome: true` shows the rest.
+function splitBrowser(nodes) {
+  const page = new Set();
+  let docDepth = -1;
+  for (const n of nodes) {
+    if (docDepth >= 0 && n.depth > docDepth) { page.add(n.i); continue; }
+    docDepth = -1;
+    if (n.role === 'Document') { page.add(n.i); docDepth = n.depth; }
+  }
+  return page;
+}
+
+function keepChrome(n) {
+  if (n.role === 'TabItem') return true;
+  if (n.role === 'Edit' && n.text && URLISH.test(flat(n.text))) return true;
+  return false;
+}
+
+export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean = false, chrome = false, ms = null } = {}) {
+  const nodes = snap.nodes || [];
+  const page = snap.web && !chrome ? splitBrowser(nodes) : null;
+  const hasPage = page && page.size > 0;
+
+  // The page URL lives in the Document's value in every Chromium browser.
+  let url = null;
+  if (hasPage) {
+    const doc = nodes.find((n) => n.role === 'Document' && n.text && URLISH.test(flat(n.text)));
+    if (doc) url = flat(doc.text);
+  }
+  const host = url ? pageHost(url) : null;
 
   let pruned = 0;
+  let hiddenChrome = 0;
   const rows = [];
+  // Indentation follows the ancestors actually shown, so a control twenty
+  // wrapper-divs deep does not arrive with twenty levels of spaces in front.
+  const shown = [];
 
-  for (const n of snap.nodes) {
+  for (const n of nodes) {
+    if (hasPage && !page.has(n.i) && !keepChrome(n)) { hiddenChrome++; continue; }
+
     const acts = (n.patterns || []).filter((p) => ACTIONABLE.has(p));
     const st = n.state || {};
-    const bare = !n.name && !n.aid && !n.text && acts.length === 0;
-    if (bare && STRUCTURAL.has(n.role)) { pruned++; continue; }
+    const name = flat(n.name);
+    const txt = flat(n.text);
+    const bare = !name && !n.aid && !txt && acts.length === 0;
+    if (bare) { pruned++; continue; }
+    if (n.role === 'Text' && !n.aid && acts.length === 0 && SEPARATOR.test(name) && !txt) { pruned++; continue; }
 
-    const indent = '  '.repeat(Math.min(n.depth, 8));
+    while (shown.length && shown[shown.length - 1] >= n.depth) shown.pop();
+    const indent = '  '.repeat(Math.min(shown.length, 8));
+    shown.push(n.depth);
+
     let line = `[${n.i}]${indent} ${n.role}`;
-    if (n.name) line += ` "${oneLine(n.name, 70)}"`;
-    if (n.aid && n.aid !== n.name) line += ` #${n.aid}`;
+    if (name) line += ` "${oneLine(name, 70)}"`;
+    if (n.aid && n.aid !== name && !/^view_\d+$/.test(n.aid)) line += ` #${n.aid}`;
     if (withRects) line += rect(n.rect);
-    if (acts.length) line += ` [${acts.join(',')}]`;
+
+    const implied = IMPLIED[n.role] || [];
+    const tags = acts.filter((p) => !implied.includes(p));
+    if (tags.length) line += ` [${tags.join(',')}]`;
 
     const flags = [];
     if (st.disabled) flags.push('disabled');
@@ -70,36 +164,48 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean 
     if (st.value !== undefined) flags.push(`value=${st.value}`);
     if (flags.length) line += ` {${flags.join(' ')}}`;
 
-    if (n.text) {
-      const flat = String(n.text).replace(/\s+/g, ' ').trim();
-      // Text that merely repeats the name is noise on every label.
-      if (flat && flat !== String(n.name || '').replace(/\s+/g, ' ').trim()) {
+    // Text that merely repeats the name is noise on every label; a link's
+    // href goes inline, shortened when it stays on this site; the page URL
+    // is already in the header.
+    if (txt && txt !== name) {
+      if (n.role === 'Hyperlink' && URLISH.test(txt)) {
+        line += ` -> ${shortHref(txt, host)}`;
+      } else if (n.role === 'Document' && txt === url) {
+        // header has it
+      } else if (txt.length <= 60) {
+        line += ` = ${JSON.stringify(txt)}`;
+      } else {
         line += `\n${indent}      = ${preview(n.text, textLimit)}`;
       }
     }
     rows.push(line);
   }
 
-  // Windows serves only a cloaked window's frame - title bar, minimise,
-  // maximise, close - and none of its contents, so what comes back looks like
-  // an application with nothing in it. Saying why is the difference between a
-  // dead end and a next step.
-  const elsewhere = snap.other_desktop
-    ? ' | ON ANOTHER VIRTUAL DESKTOP: only the window frame is readable, because Windows does not serve the contents of a window on a desktop you are not looking at. This is not an empty or broken app. Its coordinates are not on screen either, so a physical click or point target would land on whatever the user has in front of them. Bring that desktop forward before driving this window'
-    : '';
-  const cut = snap.time_budget_ms
-    ? `, TRUNCATED after ${snap.time_budget_ms}ms - this window's tree is slow to read; use interactive_only, or snapshot a smaller window`
-    : (snap.truncated ? ', TRUNCATED (raise max_nodes or use interactive_only)' : '');
-  head.push(`${rows.length} shown${pruned ? `, ${pruned} layout-only hidden` : ''}${cut}${elsewhere}`);
-  lines.push(head.join(' | '), '');
-  lines.push(...rows);
-  const out = lines.join('\n');
+  const head = [`${snap.snapshot_id} "${snap.title || '(untitled)'}" hwnd=${snap.hwnd}`];
+  if (url) head.push(`url ${url}`);
+  let count = `${rows.length} shown`;
+  if (hiddenChrome) count += `, ${hiddenChrome} browser controls hidden (chrome:true)`;
+  else if (pruned) count += `, ${pruned} layout-only hidden`;
+  if (snap.time_budget_ms) {
+    count += `, TRUNCATED after ${snap.time_budget_ms}ms - slow tree; use interactive_only or a smaller window`;
+  } else if (snap.truncated) {
+    count += ', TRUNCATED (raise max_nodes or use interactive_only)';
+  }
+  head.push(count);
+  if (ms != null) head.push(`${ms}ms`);
+  if (snap.other_desktop) {
+    // Windows serves only a cloaked window's frame - title bar, minimise,
+    // maximise, close - and none of its contents, so what comes back looks
+    // like an application with nothing in it. Saying why is the difference
+    // between a dead end and a next step.
+    head.push('ON ANOTHER VIRTUAL DESKTOP: only the frame is readable (Windows does not serve the contents of a window on a desktop you are not looking at); its coordinates are not on screen, so do not click by point. Bring that desktop forward first');
+  }
+
+  const out = [head.join(' | '), '', ...rows].join('\n');
   // Said in the output rather than in the docs, because the moment it matters
   // is the moment a big page has just been read - not before.
   if (!lean && out.length > CHATTY) {
-    return out + `\n\n[this read cost about ${Math.round(out.length / 4)} tokens. ` +
-      'If you only need controls, re-read with interactive_only:true; if you need one part of ' +
-      'the page, target it with a selector rather than reading the whole tree again.]';
+    return out + `\n\n[~${Math.round(out.length / 4)} tokens. Re-read with interactive_only:true for controls only, or target one part with a selector.]`;
   }
   return out;
 }

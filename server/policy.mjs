@@ -92,6 +92,21 @@ const USER_BLOCKED = String(process.env.CU_BLOCKED_APPS || '')
   // than an empty string, which would otherwise become a bogus blocklist entry.
   .filter((s) => s && !s.includes('${'));
 
+// Apps the user has said Computer Use may always drive - Codex's
+// always_allowed_app_ids. A grant for one of these is taken on first use
+// instead of refused, and the result says so. Blocked and shell tiers are not
+// grantable at all, so listing one here changes nothing.
+const USER_ALLOWED = String(process.env.CU_ALLOWED_APPS || '')
+  .split(',')
+  .map((s) => normalise(s.trim()))
+  .filter((s) => s && !s.includes('${'));
+
+export function isAlwaysAllowed(win) {
+  const proc = normalise(win && win.process);
+  const exe = normalise(win && win.path ? path.basename(win.path) : '');
+  return USER_ALLOWED.includes(proc) || (!!exe && USER_ALLOWED.includes(exe));
+}
+
 export function classify(win) {
   const proc = normalise(win && win.process);
   const exe = normalise(win && win.path ? path.basename(win.path) : '');
@@ -261,6 +276,10 @@ export class Policy {
     const { tier, reason } = classify(win);
     if (tier === TIER.SHELL) {
       return { ok: false, code: 'app_input_blocked', message: reason, hint: 'Use the Bash tool for shell work; it is sandboxed and auditable.' };
+    }
+    if (!this.granted(win) && isAlwaysAllowed(win)) {
+      this.grants.set(this.key(win), { grantedAt: Date.now(), tier, auto: true });
+      return { ok: true, tier, autoGranted: this.key(win) };
     }
     if (!this.granted(win)) {
       return {

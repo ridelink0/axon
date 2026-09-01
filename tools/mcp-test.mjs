@@ -102,7 +102,9 @@ async function main() {
   const snapTokens = tok(snapText);
   console.log(`     default snapshot ~${snapTokens} tokens`);
   check('snapshot renders elements', snapText.includes('Press Me'), snapText.slice(0, 300));
-  check('shows actionable patterns', snapText.includes('[Invoke]'));
+  // A Button implies Invoke, so no tag is printed for it; a pattern is tagged
+  // only on a role that does not imply it.
+  check('renders controls without redundant pattern tags', /Button "Press Me"(?! \[Invoke\])/.test(snapText));
   // Long text is previewed head+tail, so content scrolled out of view still
   // reaches the model - that is the whole reason to read a tree over pixels.
   check('shows the tail of scrolled-away text', snapText.includes('line 40 of hidden'),
