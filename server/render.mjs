@@ -64,7 +64,7 @@ function preview(s, limit) {
 
 // A Text node whose whole content is one separator glyph is layout, not
 // content: the dots between footer links, the pipes in a breadcrumb.
-const SEPARATOR = /^[\s·•|\-–—,:;/\\*]+$/;
+const SEPARATOR = /^[\s·•|\-–—,:;/\\*›‹»«]+$/;
 
 const URLISH = /^(https?:\/\/|mailto:|tel:|file:)/i;
 
