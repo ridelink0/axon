@@ -4,7 +4,8 @@
 // because it is cheap to produce and easy to test; only the rendered form
 // crosses into the context window. Everything here is about saying less:
 // a line per element, nothing a role already implies, nothing that repeats,
-// and in a browser, the page rather than the browser.
+// in a browser the page rather than the browser, and on a second read of the
+// same window only the rows that changed.
 
 const ACTIONABLE = new Set(['Invoke', 'Toggle', 'Value', 'SelectionItem', 'ExpandCollapse', 'Scroll', 'RangeValue']);
 
@@ -110,15 +111,55 @@ function keepChrome(n) {
   return false;
 }
 
-export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean = false, chrome = false, ms = null } = {}) {
-  const nodes = snap.nodes || [];
-  const page = snap.web && !chrome ? splitBrowser(nodes) : null;
+// Controls only: the root plus every node that can be acted on. Applied here
+// rather than in the host so the host always hands back the whole tree, and a
+// wait for change can compare whole trees whatever the last read showed.
+export function leanNodes(nodes) {
+  return (nodes || []).filter((n) => n.depth === 0 || (n.patterns || []).some((p) => ACTIONABLE.has(p)));
+}
+
+// The nodes under one index: the node itself and everything deeper that
+// follows it in tree order, up to the next node at its depth or shallower.
+export function subtreeNodes(nodes, index) {
+  const at = nodes.findIndex((n) => Number(n.i) === Number(index));
+  if (at < 0) return null;
+  const root = nodes[at];
+  const out = [root];
+  for (let k = at + 1; k < nodes.length; k++) {
+    if (nodes[k].depth <= root.depth) break;
+    out.push(nodes[k]);
+  }
+  return out;
+}
+
+// Rows whose name, text, automation id or role match. A pattern written as
+// /.../ or /.../i is a regular expression; anything else is a case-insensitive
+// substring. Invalid regexes fall back to a literal search rather than failing.
+export function findMatcher(pattern) {
+  const s = String(pattern || '');
+  const m = /^\/(.+)\/([a-z]*)$/.exec(s);
+  if (m) {
+    try { return new RegExp(m[1], m[2].includes('i') ? m[2] : m[2] + 'i'); } catch { /* literal */ }
+  }
+  const lit = s.toLowerCase();
+  return { test: (t) => String(t).toLowerCase().includes(lit) };
+}
+
+export function nodeMatches(n, matcher) {
+  return matcher.test(flat(n.name)) || matcher.test(flat(n.text)) || matcher.test(n.aid || '') || matcher.test(n.role || '');
+}
+
+// The per-element lines, before any header. Each row carries its stable
+// index so a later read can be compared against this one row by row.
+export function buildRows(snap, { textLimit = 200, withRects = false, chrome = false, nodes: only = null } = {}) {
+  const nodes = only || snap.nodes || [];
+  const page = snap.web && !chrome ? splitBrowser(snap.nodes || []) : null;
   const hasPage = page && page.size > 0;
 
   // The page URL lives in the Document's value in every Chromium browser.
   let url = null;
   if (hasPage) {
-    const doc = nodes.find((n) => n.role === 'Document' && n.text && URLISH.test(flat(n.text)));
+    const doc = (snap.nodes || []).find((n) => n.role === 'Document' && n.text && URLISH.test(flat(n.text)));
     if (doc) url = flat(doc.text);
   }
   const host = url ? pageHost(url) : null;
@@ -126,6 +167,9 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean 
   let pruned = 0;
   let hiddenChrome = 0;
   const rows = [];
+  // Where the keyboard focus is, so the model knows where a bare type would
+  // land without hunting for {focused} in the rows.
+  let focus = null;
   // Indentation follows the ancestors actually shown, so a control twenty
   // wrapper-divs deep does not arrive with twenty levels of spaces in front.
   const shown = [];
@@ -137,6 +181,7 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean 
     const st = n.state || {};
     const name = flat(n.name);
     const txt = flat(n.text);
+    if (st.focused && n.role !== 'Window' && n.role !== 'Pane') focus = `focus [${n.i}] ${n.role}${name ? ` "${oneLine(name, 40)}"` : ''}`;
     const bare = !name && !n.aid && !txt && acts.length === 0;
     if (bare) { pruned++; continue; }
     if (n.role === 'Text' && !n.aid && acts.length === 0 && SEPARATOR.test(name) && !txt) { pruned++; continue; }
@@ -145,7 +190,7 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean 
     const indent = '  '.repeat(Math.min(shown.length, 8));
     shown.push(n.depth);
 
-    let line = `[${n.i}]${indent} ${n.role}`;
+    let line = `${indent} ${n.role}`;
     if (name) line += ` "${oneLine(name, 70)}"`;
     if (n.aid && n.aid !== name && !/^view_\d+$/.test(n.aid)) line += ` #${n.aid}`;
     if (withRects) line += rect(n.rect);
@@ -178,36 +223,100 @@ export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean 
         line += `\n${indent}      = ${preview(n.text, textLimit)}`;
       }
     }
-    rows.push(line);
+    rows.push({ i: Number(n.i), line, role: n.role, name });
   }
+  return { rows, url, pruned, hiddenChrome, focus };
+}
 
-  const head = [`${snap.snapshot_id} "${snap.title || '(untitled)'}" hwnd=${snap.hwnd}`];
-  if (url) head.push(`url ${url}`);
+function rowText(r) { return `[${r.i}]${r.line}`; }
+
+function headLine(snap, parts, ms) {
+  const head = [`${snap.snapshot_id || 'read'} "${snap.title || '(untitled)'}" hwnd=${snap.hwnd}`];
+  for (const p of parts) if (p) head.push(p);
+  if (ms != null) head.push(`${ms}ms`);
+  return head.join(' | ');
+}
+
+function truncationNote(snap) {
+  if (snap.time_budget_ms) return `TRUNCATED after ${snap.time_budget_ms}ms - slow tree; use interactive_only or a smaller window`;
+  if (snap.truncated) return 'TRUNCATED (raise max_nodes or use interactive_only)';
+  return '';
+}
+
+function otherDesktopNote(snap) {
+  if (!snap.other_desktop) return '';
+  // Windows serves only a cloaked window's frame - title bar, minimise,
+  // maximise, close - and none of its contents, so what comes back looks
+  // like an application with nothing in it. Saying why is the difference
+  // between a dead end and a next step.
+  return 'ON ANOTHER VIRTUAL DESKTOP: only the frame is readable (Windows does not serve the contents of a window on a desktop you are not looking at); its coordinates are not on screen, so do not click by point. Bring that desktop forward first';
+}
+
+export function renderSnapshot(snap, { textLimit = 200, withRects = false, lean = false, chrome = false, ms = null, nodes = null, scope = null } = {}) {
+  const built = buildRows(snap, { textLimit, withRects, chrome, nodes });
+  const { rows, url, pruned, hiddenChrome, focus } = built;
+
   let count = `${rows.length} shown`;
+  if (scope) count = `${scope}: ${count}`;
   if (hiddenChrome) count += `, ${hiddenChrome} browser controls hidden (chrome:true)`;
   else if (pruned) count += `, ${pruned} layout-only hidden`;
-  if (snap.time_budget_ms) {
-    count += `, TRUNCATED after ${snap.time_budget_ms}ms - slow tree; use interactive_only or a smaller window`;
-  } else if (snap.truncated) {
-    count += ', TRUNCATED (raise max_nodes or use interactive_only)';
-  }
-  head.push(count);
-  if (ms != null) head.push(`${ms}ms`);
-  if (snap.other_desktop) {
-    // Windows serves only a cloaked window's frame - title bar, minimise,
-    // maximise, close - and none of its contents, so what comes back looks
-    // like an application with nothing in it. Saying why is the difference
-    // between a dead end and a next step.
-    head.push('ON ANOTHER VIRTUAL DESKTOP: only the frame is readable (Windows does not serve the contents of a window on a desktop you are not looking at); its coordinates are not on screen, so do not click by point. Bring that desktop forward first');
-  }
+  const trunc = truncationNote(snap);
+  if (trunc) count += ', ' + trunc;
 
-  const out = [head.join(' | '), '', ...rows].join('\n');
+  const out = [headLine(snap, [url ? `url ${url}` : '', count, scope ? '' : focus, otherDesktopNote(snap)], ms), '', ...rows.map(rowText)].join('\n');
   // Said in the output rather than in the docs, because the moment it matters
   // is the moment a big page has just been read - not before.
   if (!lean && out.length > CHATTY) {
-    return out + `\n\n[~${Math.round(out.length / 4)} tokens. Re-read with interactive_only:true for controls only, or target one part with a selector.]`;
+    return out + `\n\n[~${Math.round(out.length / 4)} tokens. Re-read with interactive_only:true for controls only, find:"..." for matching rows, or index:N for one subtree.]`;
   }
   return out;
+}
+
+// Keyboard focus moves whenever the user clicks somewhere, so on its own it
+// is not a change to the window; the header names the focused control.
+function lineKey(line) {
+  return line.replace(/ \{([^}]*)\}/, (m, inner) => {
+    const flags = inner.split(' ').filter((f) => f && f !== 'focused');
+    return flags.length ? ` {${flags.join(' ')}}` : '';
+  });
+}
+
+// What changed between two reads of the same window, row by row. Indices are
+// stable per window, so a row with the same index is the same control; a
+// different line for the same index is a control that changed.
+export function diffRows(prev, cur) {
+  const pm = new Map(prev.map((r) => [r.i, lineKey(r.line)]));
+  const cm = new Map(cur.map((r) => [r.i, r.line]));
+  const added = cur.filter((r) => !pm.has(r.i));
+  const changed = cur.filter((r) => pm.has(r.i) && pm.get(r.i) !== lineKey(r.line));
+  const removed = prev.filter((r) => !cm.has(r.i));
+  return { added, changed, removed, same: cur.length - added.length - changed.length };
+}
+
+// Renders only the difference. Returns null when the difference is most of
+// the tree, in which case a full listing is the shorter and clearer answer.
+export function renderDelta(snap, prevRows, built, { since, ms = null, force = false } = {}) {
+  const { rows, url } = built;
+  const d = diffRows(prevRows, rows);
+  const moved = d.added.length + d.changed.length + d.removed.length;
+  if (!force && rows.length > 0 && moved > rows.length * 0.6) return null;
+
+  const summary = moved === 0
+    ? `no change since ${since} (${rows.length} elements, same indices)`
+    : `changes since ${since}: +${d.added.length} ~${d.changed.length} -${d.removed.length}, ${d.same} same`;
+  const trunc = truncationNote(snap);
+  const out = [headLine(snap, [url ? `url ${url}` : '', summary, built.focus, trunc, otherDesktopNote(snap)], ms)];
+  if (moved) {
+    out.push('');
+    const addedIdx = new Set(d.added.map((r) => r.i));
+    const changedIdx = new Set(d.changed.map((r) => r.i));
+    for (const r of rows) {
+      if (addedIdx.has(r.i)) out.push('+ ' + rowText(r));
+      else if (changedIdx.has(r.i)) out.push('~ ' + rowText(r));
+    }
+    for (const r of d.removed) out.push(`- [${r.i}] ${r.role}${r.name ? ` "${oneLine(r.name, 50)}"` : ''}`);
+  }
+  return out.join('\n');
 }
 
 export function renderApps(windows, policy, classify) {

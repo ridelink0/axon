@@ -372,13 +372,19 @@ func opSnapshot(_ a: [String: Any]) throws -> [String: Any] {
         }
     }
 
-    snapSeq += 1
-    let sid = "s\(snapSeq)"
-    let snap = Snapshot()
-    snap.elements = elements
-    snap.pid = pid
-    snap.title = title
-    snapshots[sid] = snap
+    // A poll (wait_for) reads without keeping, so it neither bumps the
+    // sequence nor evicts a snapshot the model is still acting on.
+    let register = bool(a["register"], true)
+    var sid: String? = nil
+    if register {
+        snapSeq += 1
+        sid = "s\(snapSeq)"
+        let snap = Snapshot()
+        snap.elements = elements
+        snap.pid = pid
+        snap.title = title
+        snapshots[sid!] = snap
+    }
     while snapshots.count > maxSnapshots {
         if let oldest = snapshots.min(by: { $0.value.taken < $1.value.taken })?.key {
             snapshots.removeValue(forKey: oldest)
@@ -386,7 +392,7 @@ func opSnapshot(_ a: [String: Any]) throws -> [String: Any] {
     }
 
     return [
-        "snapshot_id": sid,
+        "snapshot_id": sid as Any,
         "hwnd": int(a["hwnd"], Int(pid) * 1000),
         "title": title,
         "rect": axRect(win) as Any,
@@ -693,8 +699,10 @@ func opWaitFor(_ a: [String: Any]) throws -> [String: Any] {
     let deadline = Date().addingTimeInterval(Double(timeout) / 1000.0)
     let started = Date()
 
+    var poll = a
+    poll["register"] = false
     while Date() < deadline {
-        if let snap = try? opSnapshot(a), let nodes = snap["nodes"] as? [[String: Any]] {
+        if let snap = try? opSnapshot(poll), let nodes = snap["nodes"] as? [[String: Any]] {
             for n in nodes {
                 let name = n["name"] as? String
                 let role = n["role"] as? String
@@ -848,19 +856,32 @@ func readLoop() {
                   "error": ["code": "host_error", "message": String(describing: error)]])
         }
     }
+    // stdin closed: the server is gone, and so is any reason to keep pumping
+    // the event tap. Without this a warm-up run would never exit.
+    exit(0)
 }
 
 // MARK: - Entry
 
-if let v = ProcessInfo.processInfo.environment["AXON_IDLE_MS"], let n = Int(v) { idleThresholdMs = n }
-if let v = ProcessInfo.processInfo.environment["AXON_WAIT_MS"], let n = Int(v) { waitBudgetMs = n }
-if let v = ProcessInfo.processInfo.environment["AXON_MODE"], !v.isEmpty { defaultMode = v }
+if let v = ProcessInfo.processInfo.environment["CU_IDLE_MS"], let n = Int(v) { idleThresholdMs = n }
+if let v = ProcessInfo.processInfo.environment["CU_WAIT_MS"], let n = Int(v) { waitBudgetMs = n }
+if let v = ProcessInfo.processInfo.environment["CU_MODE"], !v.isEmpty { defaultMode = v }
+
+if CommandLine.arguments.contains("--warmup") {
+    // build.mjs runs this once after compiling, to be sure the binary starts.
+    emit(["event": "warm"])
+    exit(0)
+}
 
 if CommandLine.arguments.contains("--self-test") {
     // One command a Mac user can run to see whether this host actually works
-    // on their machine, without involving Claude at all.
+    // on their machine, without involving Claude at all. The exit code says
+    // what the last line says, so a script can trust it.
+    var ok = true
     print("axon macOS host self-test")
-    print("  accessibility permission : \(trusted() ? "granted" : "DENIED - grant it in System Settings > Privacy & Security > Accessibility")")
+    let ax = trusted()
+    if !ax { ok = false }
+    print("  accessibility permission : \(ax ? "granted" : "DENIED - grant it in System Settings > Privacy & Security > Accessibility")")
     Presence.shared.start()
     RunLoop.current.run(until: Date().addingTimeInterval(0.5))
     print("  presence monitoring      : \(Presence.shared.monitoring ? "active" : "UNAVAILABLE")")
@@ -868,14 +889,17 @@ if CommandLine.arguments.contains("--self-test") {
         let apps = try opListApps([:])
         let count = (apps["windows"] as? [[String: Any]])?.count ?? 0
         print("  windows visible          : \(count)")
+        if count == 0 { ok = false }
         print(count > 0 ? "PASS" : "FAIL: no windows enumerated")
     } catch let e as AxonError {
         print("  list_apps                : FAILED \(e.code) - \(e.message)")
         print("FAIL")
+        ok = false
     } catch {
         print("FAIL: \(error)")
+        ok = false
     }
-    exit(0)
+    exit(ok ? 0 : 1)
 }
 
 Presence.shared.start()

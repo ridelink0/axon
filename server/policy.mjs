@@ -19,8 +19,9 @@ const BLOCKED = [
   // answer a UAC prompt or a login screen on the user's behalf.
   'consent', 'logonui', 'credentialuibroker', 'lsass', 'winlogon',
   'systemsettingsadminflows', 'useraccountcontrolsettings',
-  // Security tooling
-  'mmc', 'secpol', 'gpedit', 'certmgr', 'bitlockerwizard',
+  // Security tooling, and the Windows Security app itself (SecurityHealthUI),
+  // which Codex refuses too: an agent must never turn protection off.
+  'mmc', 'secpol', 'gpedit', 'certmgr', 'bitlockerwizard', 'securityhealth',
 ];
 
 // Actable only after a grant that spells out what it covers. These reach far
@@ -126,6 +127,10 @@ export function classify(win) {
   for (const c of candidates) {
     if (SHELL_APPS.includes(c)) return { tier: TIER.SHELL, reason: shellReason };
   }
+  // The Run dialog is a command line with a friendlier face.
+  if (candidates.includes('explorer') && /^run$/i.test(String(win && win.title || '').trim())) {
+    return { tier: TIER.SHELL, reason: shellReason };
+  }
   const cls = win && win.class ? String(win.class) : '';
   if (CONSOLE_CLASSES.some((k) => cls === k || cls.startsWith(k))) {
     return { tier: TIER.SHELL, reason: shellReason };
@@ -163,9 +168,13 @@ const CONSEQUENTIAL = new RegExp([
   String.raw`|book\s+(now|ride|trip|flight|hotel)|request\s+(ride|trip|pickup)`,
   String.raw`|subscribe|donate|transfer|withdraw)\b`,
   // things that leave the machine
-  String.raw`|\b(send|reply\s+all|post|publish|tweet|invite|submit\s+(order|payment|application|form))\b`,
+  String.raw`|\b(send|reply\s+all|post|publish|tweet|invite|upload|submit\s+(order|payment|application|form))\b`,
   // things that do not come back
   String.raw`|\b(delete|permanently\s+delete|empty\s+trash|empty\s+bin|erase|wipe|uninstall|revoke)\b`,
+  // things Codex's confirmation policy names too: software, access, passwords,
+  // and cancelling something that was booked or paid for
+  String.raw`|\b(install|cancel\s+(order|subscription|appointment|reservation|booking|plan)`,
+  String.raw`|(change|reset)\s+password|(grant|allow)\s+access)\b`,
 ].join(''), 'i');
 
 // True when a control's name says pressing it has consequences the user should

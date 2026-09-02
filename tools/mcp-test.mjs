@@ -201,9 +201,14 @@ async function main() {
 
   console.log('\n-- a second Claude session on the same computer --');
   {
+    // Real Claude Code sessions may be registered alongside the test's own,
+    // so every count here is relative to what was there at the start.
+    const peersIn = (s) => { const m = /other Claude sessions on this computer: (\d+|none)/.exec(s); return m ? (m[1] === 'none' ? 0 : Number(m[1])) : -1; };
     const alone = body(await c.call('computer_status'));
-    check('with one session, status says so', /other Claude sessions on this computer: none/.test(alone),
+    const n0 = peersIn(alone);
+    check('status counts the other sessions', n0 >= 0,
       (alone.split('\n').find((l) => l.includes('other Claude')) || alone.slice(-200)));
+    const mine = (/this session: session (\d+)/.exec(alone) || [])[1];
 
     const c2 = new Client();
     await c2.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test2', version: '1' } });
@@ -211,13 +216,13 @@ async function main() {
     await c2.call('computer_apps');   // makes it start its host and heartbeat
 
     const st1 = body(await c.call('computer_status'));
-    check('the first session now sees the second', /other Claude sessions on this computer: 1/.test(st1),
+    check('the first session now sees one more', peersIn(st1) === n0 + 1,
       (st1.split('\n').find((l) => l.includes('other Claude')) || st1.slice(-260)));
-    check('it names which session that is', /session 2 \(pid \d+\)/.test(st1), st1.slice(-260));
+    check('it names which session that is', /session \d+ \(pid \d+\)/.test(st1), st1.slice(-260));
 
     const st2 = body(await c2.call('computer_status'));
-    check('and the second sees the first', /session 1 \(pid \d+\)/.test(st2), st2.slice(-260));
-    check('the second session knows it is session 2', /this session: session 2/.test(st2), st2.slice(-260));
+    check('and the second sees the first', mine && new RegExp(`session ${mine} \\(pid \\d+\\)`).test(st2), st2.slice(-260));
+    check('the second session has its own slot', /this session: session \d+/.test(st2) && !new RegExp(`this session: session ${mine}\\b`).test(st2), st2.slice(-260));
 
     // Grants must never be inherited: session 2 was never granted this app.
     const notMine = await c2.call('computer_click', { hwnd, selector: { name: 'Press Me' }, mode: 'take' });
@@ -236,8 +241,7 @@ async function main() {
     c2.stop();
     await new Promise((r) => setTimeout(r, 600));
     const st3 = body(await c.call('computer_status'));
-    check('a session that exits deregisters itself',
-      /other Claude sessions on this computer: none/.test(st3),
+    check('a session that exits deregisters itself', peersIn(st3) === n0,
       (st3.split('\n').find((l) => l.includes('other Claude')) || st3.slice(-200)));
     await c.call('computer_grant', { revoke: 'all' });
   }
@@ -306,7 +310,8 @@ async function main() {
   }
 
   console.log('\n-- with_image degrades instead of failing --');
-  const withImg = await c.call('computer_snapshot', { hwnd, with_image: true });
+  // full:true, because a repeat read of an unchanged window is a delta.
+  const withImg = await c.call('computer_snapshot', { hwnd, with_image: true, full: true });
   check('with_image returns the tree', body(withImg).includes('Press Me'));
   const hasImg = (withImg.content || []).some((x) => x.type === 'image');
   check('with_image attaches an image or explains why not',

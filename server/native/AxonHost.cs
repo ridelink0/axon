@@ -56,6 +56,17 @@ namespace Axon
         [DllImport("dwmapi.dll")] internal static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int val, int size);
         [DllImport("user32.dll", SetLastError = true)] internal static extern uint SendInput(uint n, INPUT[] inputs, int size);
         [DllImport("user32.dll")] internal static extern bool BlockInput(bool block);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] internal static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
+        [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr h, ref POINT p);
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct GUITHREADINFO
+        {
+            public int cbSize; public int flags;
+            public IntPtr hwndActive; public IntPtr hwndFocus; public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret;
+            public RECT rcCaret;
+        }
 
         // Exclusive mode: hold off the user's physical mouse and keyboard for the
         // length of a single action, so their hand cannot land in the middle of
@@ -74,55 +85,56 @@ namespace Axon
         static readonly object _blockLock = new object();
         static bool _blocked;
         static DateTime _blockedAt;
-        static System.Threading.Thread _watchdog;
+        // Only the thread that blocked input can unblock it, so one thread
+        // does both: it blocks, waits to be told to let go (an action ending,
+        // Escape, or the deadline), and unblocks.
+        static readonly System.Threading.ManualResetEvent _release = new System.Threading.ManualResetEvent(false);
 
         internal static bool BeginExclusive()
         {
             lock (_blockLock)
             {
                 if (_blocked) return true;
-                if (!BlockInput(true)) return false;
-                _blocked = true;
-                _blockedAt = DateTime.UtcNow;
-                StartWatchdog();
-                return true;
+                bool ok = false;
+                _release.Reset();
+                using (System.Threading.ManualResetEvent started = new System.Threading.ManualResetEvent(false))
+                {
+                    System.Threading.Thread holder = new System.Threading.Thread(delegate()
+                    {
+                        try
+                        {
+                            ok = BlockInput(true);
+                            try { started.Set(); } catch { }
+                            if (!ok) return;
+                            // Nothing about a stuck action may leave the machine
+                            // unusable: the hold ends by itself after ReleaseAfterMs.
+                            _release.WaitOne(ReleaseAfterMs);
+                            BlockInput(false);
+                        }
+                        catch { try { BlockInput(false); } catch { } }
+                        finally { lock (_blockLock) { _blocked = false; } }
+                    });
+                    holder.IsBackground = true;
+                    holder.Name = "computer-use-input-hold";
+                    holder.Start();
+                    started.WaitOne(2000);
+                }
+                if (ok) { _blocked = true; _blockedAt = DateTime.UtcNow; }
+                return ok;
             }
         }
 
         internal static void EndExclusive()
         {
-            lock (_blockLock)
-            {
-                if (!_blocked) return;
-                BlockInput(false);
-                _blocked = false;
-            }
+            lock (_blockLock) { if (!_blocked) return; }
+            try { _release.Set(); } catch { }
         }
 
         internal static bool InputBlocked { get { lock (_blockLock) { return _blocked; } } }
 
         static void StartWatchdog()
         {
-            if (_watchdog != null) return;
-            _watchdog = new System.Threading.Thread(delegate()
-            {
-                // Nothing about a stuck action may leave the machine unusable.
-                while (true)
-                {
-                    System.Threading.Thread.Sleep(200);
-                    lock (_blockLock)
-                    {
-                        if (_blocked && (DateTime.UtcNow - _blockedAt).TotalMilliseconds > ReleaseAfterMs)
-                        {
-                            BlockInput(false);
-                            _blocked = false;
-                        }
-                    }
-                }
-            });
-            _watchdog.IsBackground = true;
-            _watchdog.Name = "computer-use-input-watchdog";
-            _watchdog.Start();
+            // Kept for callers; the hold thread now releases itself.
         }
 
         [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int Left, Top, Right, Bottom; }
@@ -300,17 +312,37 @@ namespace Axon
 
     internal class Snapshot
     {
-        public List<AutomationElement> Elements = new List<AutomationElement>();
+        public Dictionary<int, AutomationElement> Elements = new Dictionary<int, AutomationElement>();
         public IntPtr Hwnd;
         public string Title;
         public DateTime Taken;
     }
 
+    // One index per element per window, for the life of the window. UI
+    // Automation gives every element a RuntimeId that is unique while it
+    // exists; keying the index on it means a control keeps its number from one
+    // read to the next, so a second read can say only what changed, and an
+    // index Claude saw once can be acted on without a fresh snapshot.
+    internal class WalkIds
+    {
+        public Dictionary<string, int> Seen = new Dictionary<string, int>();
+        public HashSet<int> Used = new HashSet<int>();
+    }
+
+    internal class StableTable
+    {
+        public Dictionary<string, int> ByRid = new Dictionary<string, int>();
+        public Dictionary<int, AutomationElement> Latest = new Dictionary<int, AutomationElement>();
+        public int Next = 0;
+        public DateTime Seen;
+    }
+
     internal static class Program
     {
         static Dictionary<string, Snapshot> _snapshots = new Dictionary<string, Snapshot>();
+        static Dictionary<long, StableTable> _stable = new Dictionary<long, StableTable>();
         static int _snapSeq = 0;
-        const int MaxSnapshots = 8;
+        const int MaxSnapshots = 16;
         static string _dpiMode = "none";
         // True while an operation is in flight, so Escape can tell "stop this"
         // from "the user pressed Escape in their own app".
@@ -358,7 +390,7 @@ namespace Axon
             Presence.OnPanic = delegate
             {
                 Native.EndExclusive();
-                if (_busy || Overlay.ActiveWithin(3000)) Overlay.RequestStop();
+                if (_busy || _taskActive || Overlay.ActiveWithin(3000)) Overlay.RequestStop();
             };
             Overlay.Configure(
                 EnvInt("CU_SESSION_SLOT", 0),
@@ -390,6 +422,10 @@ namespace Axon
             // Which colour this session's cursor, marker and banner are drawn
             // in. One Claude is always Claude's own colour; a second is not.
             ready["accent"] = Overlay.AccentHex;
+            // Indices are keyed on RuntimeId and survive across reads of a
+            // window. The server only computes deltas when a host says so; a
+            // host without this flag gets a full listing on every read.
+            ready["stable"] = true;
             WriteLine(ready);
 
             while (true)
@@ -421,7 +457,7 @@ namespace Axon
 
                     System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
                     object result;
-                    _busy = true;
+                    _busy = IsActingOp(op);
                     try { result = Dispatch(op, a); }
                     finally { _busy = false; sw.Stop(); }
                     Respond(reqId, result, sw.ElapsedMilliseconds);
@@ -470,6 +506,8 @@ namespace Axon
                 case "wait_for": return OpWaitFor(a);
                 case "screenshot": return OpScreenshot(a);
                 case "clipboard": return OpClipboard(a);
+                case "describe": return OpDescribe(a);
+                case "busy": return OpBusy(a);
                 default: throw new AxonError("unknown_op", "Unknown operation '" + op + "'.");
             }
         }
@@ -1043,6 +1081,7 @@ namespace Axon
             cr.Add(AutomationElement.HasKeyboardFocusProperty);
             cr.Add(AutomationElement.IsKeyboardFocusableProperty);
             cr.Add(AutomationElement.NativeWindowHandleProperty);
+            cr.Add(AutomationElement.RuntimeIdProperty);
             cr.Add(AutomationElement.IsInvokePatternAvailableProperty);
             cr.Add(AutomationElement.IsTogglePatternAvailableProperty);
             cr.Add(AutomationElement.IsValuePatternAvailableProperty);
@@ -1208,6 +1247,14 @@ namespace Axon
             int maxNodes = hasNodes ? Int(Get(a, "max_nodes"), 400) : (web ? 1500 : 400);
             int maxDepth = hasDepth ? Int(Get(a, "max_depth"), 14) : (web ? 45 : 14);
             bool interactiveOnly = Bool(Get(a, "interactive_only"), false);
+            // A poll (wait_for change / text) reads the tree without keeping
+            // it, so it neither bumps the snapshot sequence nor evicts a
+            // snapshot Claude is still acting on.
+            bool register = Bool(Get(a, "register"), true);
+            long hkey = 0;
+            try { hkey = (long)win.Current.NativeWindowHandle; } catch { }
+            StableTable table = StableFor(hkey);
+            WalkIds usedIdx = new WalkIds();
 
             System.Diagnostics.Stopwatch walkClock = System.Diagnostics.Stopwatch.StartNew();
             int walkBudgetMs = EnvInt("CU_SNAPSHOT_MS", 8000);
@@ -1262,7 +1309,7 @@ namespace Axon
                 webWaitMs += 120;
             }
 
-            List<AutomationElement> elements = new List<AutomationElement>();
+            Dictionary<int, AutomationElement> elements = new Dictionary<int, AutomationElement>();
             List<object> nodes = new List<object>();
             bool truncated = false;
             bool ranOutOfTime = false;
@@ -1278,6 +1325,15 @@ namespace Axon
                 while (stack.Count > 0)
                 {
                     if (nodes.Count >= maxNodes) { truncated = true; break; }
+                    // The wall clock covers the whole read, fetch included. The
+                    // root always goes in, so a tight budget still hands back a
+                    // tree rather than nothing.
+                    if (nodes.Count > 0 && walkClock.ElapsedMilliseconds > walkBudgetMs)
+                    {
+                        truncated = true;
+                        ranOutOfTime = true;
+                        break;
+                    }
                     Frame f = stack.Pop();
                     AutomationElement el = f.El;
 
@@ -1294,7 +1350,8 @@ namespace Axon
                     {
                         Dictionary<string, object> node = new Dictionary<string, object>();
                         string role = CachedRole(el);
-                        node["i"] = nodes.Count;
+                        int idx = StableIndex(table, RidOf(el, true), el, usedIdx);
+                        node["i"] = idx;
                         node["role"] = role;
                         node["depth"] = f.Depth;
                         string nm = CleanText(CachedProp(el, AutomationElement.NameProperty) as string);
@@ -1310,15 +1367,24 @@ namespace Axon
                         // an editor - and only a bounded number of times.
                         string txt = null;
                         if (patterns.Contains("Value")) txt = CleanText(CachedProp(el, ValuePattern.ValueProperty) as string);
-                        if (txt == null && patterns.Contains("Text") && (role == "Document" || role == "Edit") && liveTextReads < 24)
+                        if (txt == null && patterns.Contains("Text") && (role == "Document" || role == "Edit") && liveTextReads < 24
+                            && walkClock.ElapsedMilliseconds < walkBudgetMs / 2)
                         {
                             liveTextReads++;
+                            // A live call into the app, so it runs with a deadline:
+                            // one wedged editor must not hold the whole read.
+                            string got = null;
+                            AutomationElement tel = el;
                             try
                             {
-                                TextPattern tp = el.GetCurrentPattern(TextPattern.Pattern) as TextPattern;
-                                if (tp != null) txt = CleanText(tp.DocumentRange.GetText(4000));
+                                RunPattern(delegate
+                                {
+                                    TextPattern tp = tel.GetCurrentPattern(TextPattern.Pattern) as TextPattern;
+                                    if (tp != null) got = tp.DocumentRange.GetText(4000);
+                                }, 1500);
                             }
                             catch { }
+                            txt = CleanText(got);
                         }
                         if (txt != null)
                         {
@@ -1358,7 +1424,7 @@ namespace Axon
                         }
                         if (st.Count > 0) node["state"] = st;
                         nodes.Add(node);
-                        elements.Add(el);
+                        elements[idx] = el;
                     }
 
                     if (f.Depth < maxDepth)
@@ -1409,7 +1475,8 @@ namespace Axon
                     if (include)
                     {
                         Dictionary<string, object> node = new Dictionary<string, object>();
-                        node["i"] = nodes.Count;
+                        int idx = StableIndex(table, RidOf(el, false), el, usedIdx);
+                        node["i"] = idx;
                         node["role"] = RoleOf(el);
                         node["depth"] = f.Depth;
                         string nm = CleanText(NameOf(el));
@@ -1423,7 +1490,7 @@ namespace Axon
                         Dictionary<string, object> st = StateOf(el, patterns);
                         if (st != null) node["state"] = st;
                         nodes.Add(node);
-                        elements.Add(el);
+                        elements[idx] = el;
                     }
 
                     if (f.Depth < maxDepth)
@@ -1446,8 +1513,6 @@ namespace Axon
                 }
             }
 
-            _snapSeq++;
-            string sid = "s" + _snapSeq.ToString(CultureInfo.InvariantCulture);
             Snapshot snap = new Snapshot();
             snap.Elements = elements;
             snap.Taken = DateTime.UtcNow;
@@ -1457,7 +1522,13 @@ namespace Axon
                 snap.Title = win.Current.Name;
             }
             catch { }
-            _snapshots[sid] = snap;
+            string sid = null;
+            if (register)
+            {
+                _snapSeq++;
+                sid = "s" + _snapSeq.ToString(CultureInfo.InvariantCulture);
+                _snapshots[sid] = snap;
+            }
 
             // Bound memory: drop oldest once past the cap.
             while (_snapshots.Count > MaxSnapshots)
@@ -1494,25 +1565,39 @@ namespace Axon
         static AutomationElement SnapshotElement(Dictionary<string, object> a)
         {
             string sid = Str(Get(a, "snapshot_id"));
-            if (string.IsNullOrEmpty(sid))
+            int idx = Int(Get(a, "index"), -1);
+            IntPtr h = HwndArg(a);
+            Snapshot snap = null;
+            if (!string.IsNullOrEmpty(sid)) _snapshots.TryGetValue(sid, out snap);
+            else if (_snapSeq > 0) _snapshots.TryGetValue("s" + _snapSeq.ToString(CultureInfo.InvariantCulture), out snap);
+            // The caller's window wins. A snapshot of some other window - the
+            // newest one, or a stale id - must never supply the element.
+            if (snap != null && h != IntPtr.Zero && snap.Hwnd != h) snap = null;
+
+            AutomationElement el = null;
+            if (snap != null && idx >= 0) snap.Elements.TryGetValue(idx, out el);
+            if (el == null && idx >= 0)
             {
-                if (_snapSeq == 0)
+                // Indices are stable per window, so one seen in any earlier
+                // read of this window still names the same control.
+                IntPtr th = h != IntPtr.Zero ? h : (snap != null ? snap.Hwnd : IntPtr.Zero);
+                StableTable t;
+                if (th != IntPtr.Zero && _stable.TryGetValue((long)th, out t)) t.Latest.TryGetValue(idx, out el);
+            }
+            if (el == null)
+            {
+                if (_snapSeq == 0 && _stable.Count == 0)
                     throw new AxonError("no_snapshot", "No snapshot has been taken yet.",
                         "Call snapshot on the target window, then act on an index from it.");
-                sid = "s" + _snapSeq.ToString(CultureInfo.InvariantCulture);
-            }
-            Snapshot snap;
-            if (!_snapshots.TryGetValue(sid, out snap))
-                throw new AxonError("snapshot_expired", "Snapshot " + sid + " is no longer held.",
-                    "Take a fresh snapshot and use its indices.");
-
-            int idx = Int(Get(a, "index"), -1);
-            if (idx < 0 || idx >= snap.Elements.Count)
+                if (idx < 0)
+                    throw new AxonError("index_out_of_range", "Index " + idx + " is not valid.", "Re-read the snapshot listing.");
+                if (snap == null && !string.IsNullOrEmpty(sid))
+                    throw new AxonError("snapshot_expired", "Snapshot " + sid + " is no longer held and index " + idx + " is not known for this window.",
+                        "Take a fresh snapshot and use its indices.");
                 throw new AxonError("index_out_of_range",
-                    "Index " + idx + " is outside snapshot " + sid + " (0.." + (snap.Elements.Count - 1) + ").",
-                    "Re-read the snapshot listing.");
-
-            AutomationElement el = snap.Elements[idx];
+                    "Index " + idx + " is not an element of this window" + (sid != null ? " (snapshot " + sid + ")" : "") + ".",
+                    "Indices are stable per window; take a snapshot of the window to see them.");
+            }
             // Liveness probe, so a destroyed control fails loudly here instead of
             // silently acting on whatever now occupies its coordinates.
             try { ControlType ignored = el.Current.ControlType; }
@@ -1522,6 +1607,210 @@ namespace Axon
                     "The UI changed. Take a fresh snapshot.");
             }
             return el;
+        }
+
+        static StableTable StableFor(long hwnd)
+        {
+            if (_stable.Count > 24)
+            {
+                List<long> dead = new List<long>();
+                foreach (KeyValuePair<long, StableTable> kv in _stable)
+                    if (kv.Key != 0 && !Native.IsWindow(new IntPtr(kv.Key))) dead.Add(kv.Key);
+                foreach (long d in dead) _stable.Remove(d);
+                while (_stable.Count > 64)
+                {
+                    long oldestKey = 0; DateTime oldest = DateTime.MaxValue;
+                    foreach (KeyValuePair<long, StableTable> kv in _stable)
+                        if (kv.Value.Seen < oldest) { oldest = kv.Value.Seen; oldestKey = kv.Key; }
+                    _stable.Remove(oldestKey);
+                }
+            }
+            StableTable t;
+            if (!_stable.TryGetValue(hwnd, out t)) { t = new StableTable(); _stable[hwnd] = t; }
+            // A page that has navigated a hundred times has seen thousands of
+            // elements come and go; past a point the table starts over.
+            if (t.Latest.Count > 6000) { t.ByRid.Clear(); t.Latest.Clear(); }
+            t.Seen = DateTime.UtcNow;
+            return t;
+        }
+
+        static int StableIndex(StableTable t, string rid, AutomationElement el, WalkIds ids)
+        {
+            int idx;
+            if (rid != null)
+            {
+                // A provider that hands two elements the same RuntimeId gets a
+                // distinct key for the second, and the same one on every read.
+                int n;
+                ids.Seen.TryGetValue(rid, out n);
+                ids.Seen[rid] = n + 1;
+                if (n > 0) rid = rid + "#" + n.ToString(CultureInfo.InvariantCulture);
+                if (t.ByRid.TryGetValue(rid, out idx) && !ids.Used.Contains(idx))
+                {
+                    t.Latest[idx] = el;
+                    ids.Used.Add(idx);
+                    return idx;
+                }
+            }
+            idx = t.Next++;
+            if (rid != null && !t.ByRid.ContainsKey(rid)) t.ByRid[rid] = idx;
+            t.Latest[idx] = el;
+            ids.Used.Add(idx);
+            return idx;
+        }
+
+        static string RidOf(AutomationElement el, bool cached)
+        {
+            try
+            {
+                int[] ids = cached ? (CachedProp(el, AutomationElement.RuntimeIdProperty) as int[]) : el.GetRuntimeId();
+                if (ids == null || ids.Length == 0) return null;
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < ids.Length; i++)
+                {
+                    if (i > 0) sb.Append('.');
+                    sb.Append(ids[i].ToString(CultureInfo.InvariantCulture));
+                }
+                return sb.ToString();
+            }
+            catch { return null; }
+        }
+
+        // ---- posted input ------------------------------------------------------
+        //
+        // A window that is not in front can still be typed into: Windows
+        // delivers a posted WM_CHAR to the control it names, and the app
+        // handles it exactly as it handles a translated keystroke, with no
+        // change of focus, foreground or cursor. That is how Claude types into
+        // Notepad behind the document the user is writing. The write is read
+        // back before it is believed; a control that ignores posted characters
+        // reports nothing changed and the caller falls back to real keys.
+
+        const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102, WM_MOUSEMOVE = 0x0200;
+        const uint WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205;
+        const uint WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208;
+
+        static string ReadElementText(AutomationElement el)
+        {
+            try
+            {
+                object vp = null;
+                try { vp = el.GetCurrentPattern(ValuePattern.Pattern); } catch { }
+                if (vp != null) return ((ValuePattern)vp).Current.Value ?? "";
+                object tp = null;
+                try { tp = el.GetCurrentPattern(TextPattern.Pattern); } catch { }
+                if (tp != null) return ((TextPattern)tp).DocumentRange.GetText(8000) ?? "";
+            }
+            catch { }
+            return null;
+        }
+
+        static string LongestLine(string text)
+        {
+            string best = "";
+            foreach (string part in text.Replace("\r", "").Split('\n'))
+            {
+                string t = part.Trim();
+                if (t.Length > best.Length) best = t;
+            }
+            return best.Length > 60 ? best.Substring(0, 60) : best;
+        }
+
+        static string TryPostText(AutomationElement el, IntPtr top, string text, bool force)
+        {
+            int elH = 0; try { elH = el.Current.NativeWindowHandle; } catch { }
+            bool elFocused = false; try { elFocused = el.Current.HasKeyboardFocus; } catch { }
+            uint pid; uint tid = Native.GetWindowThreadProcessId(top, out pid);
+            IntPtr focus = IntPtr.Zero;
+            try
+            {
+                Native.GUITHREADINFO gti = new Native.GUITHREADINFO();
+                gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
+                if (Native.GetGUIThreadInfo(tid, ref gti)) focus = gti.hwndFocus;
+            }
+            catch { }
+            IntPtr dest = IntPtr.Zero;
+            // A windowed control takes WM_CHAR directly. A child of a framework
+            // window (XAML, Chromium) has no handle of its own: characters go
+            // to the app's focused control, so only that control can be
+            // addressed - anything else would type into the wrong field.
+            if (elH != 0 && new IntPtr(elH) != top) dest = new IntPtr(elH);
+            else if (focus != IntPtr.Zero && (elFocused || force)) dest = focus;
+            if (dest == IntPtr.Zero) return null;
+
+            string before = ReadElementText(el);
+            // Unverifiable writes are made only when asked for by name.
+            if (before == null && !force) return null;
+
+            Trace(el, "type", top);
+            foreach (char c in text)
+            {
+                if (c == '\r') continue;
+                if (c == '\n')
+                {
+                    Native.PostMessageW(dest, WM_KEYDOWN, new IntPtr(0x0D), new IntPtr(0x001C0001));
+                    Native.PostMessageW(dest, WM_CHAR, new IntPtr(0x0D), new IntPtr(0x001C0001));
+                    Native.PostMessageW(dest, WM_KEYUP, new IntPtr(0x0D), new IntPtr(unchecked((int)0xC01C0001)));
+                    continue;
+                }
+                if (c == '\t') { Native.PostMessageW(dest, WM_CHAR, new IntPtr(0x09), new IntPtr(1)); continue; }
+                Native.PostMessageW(dest, WM_CHAR, new IntPtr(c), new IntPtr(1));
+            }
+            if (before == null) return "posted_unverified";
+            string chunk = LongestLine(text);
+            for (int i = 0; i < 20; i++)
+            {
+                System.Threading.Thread.Sleep(50);
+                string after = ReadElementText(el);
+                if (after != null && after != before)
+                    return after.Contains(chunk) ? "posted" : "posted_changed";
+            }
+            // Nothing moved in a second: the control ignored posted characters,
+            // so nothing was typed and the caller may use real keys.
+            return null;
+        }
+
+        static object PostedClick(Dictionary<string, object> a, AutomationElement el, string button, int clicks)
+        {
+            int[] p;
+            try { p = ClickPointOf(el); } catch { return null; }
+            IntPtr top = HwndArg(a);
+            if (top == IntPtr.Zero) top = TopWindowOf(el);
+            int elH = 0; try { elH = el.Current.NativeWindowHandle; } catch { }
+            IntPtr dest = elH != 0 ? new IntPtr(elH) : top;
+            if (dest == IntPtr.Zero) return null;
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            // Some frameworks (WinForms among them) check the pointer's window
+            // before firing a click, so a posted click on a spot another
+            // window covers is silently dropped there. Say so.
+            try
+            {
+                IntPtr onTop = Native.RootWindowAt(p[0], p[1]);
+                IntPtr topRoot = Native.GetAncestor(top, 2 /* GA_ROOT */);
+                if (topRoot == IntPtr.Zero) topRoot = top;
+                if (onTop != IntPtr.Zero && !Overlay.IsAnyOverlayWindow(onTop) && onTop != topRoot) res["covered"] = true;
+            }
+            catch { }
+            Native.POINT cp = new Native.POINT();
+            cp.X = p[0]; cp.Y = p[1];
+            Native.ScreenToClient(dest, ref cp);
+            IntPtr lp = new IntPtr((cp.Y << 16) | (cp.X & 0xFFFF));
+            uint down = button == "right" ? WM_RBUTTONDOWN : (button == "middle" ? WM_MBUTTONDOWN : WM_LBUTTONDOWN);
+            uint up = button == "right" ? WM_RBUTTONUP : (button == "middle" ? WM_MBUTTONUP : WM_LBUTTONUP);
+            IntPtr wp = new IntPtr(button == "right" ? 2 : (button == "middle" ? 0x10 : 1));
+            Trace(el, "click", top);
+            Native.PostMessageW(dest, WM_MOUSEMOVE, IntPtr.Zero, lp);
+            for (int i = 0; i < Math.Max(1, clicks); i++)
+            {
+                Native.PostMessageW(dest, down, wp, lp);
+                Native.PostMessageW(dest, up, IntPtr.Zero, lp);
+            }
+            res["method"] = "posted_click";
+            res["point"] = p;
+            res["background"] = true;
+            System.Threading.Thread.Sleep(80);
+            AddNowState(res, el);
+            return res;
         }
 
         static Dictionary<string, ControlType> _controlTypes;
@@ -2001,7 +2290,9 @@ namespace Axon
         // so the caller knows the outcome is unconfirmed.
         const int PatternDeadlineMs = 15000;
 
-        static bool RunPattern(Action act)
+        static bool RunPattern(Action act) { return RunPattern(act, PatternDeadlineMs); }
+
+        static bool RunPattern(Action act, int deadlineMs)
         {
             Exception failure = null;
             using (System.Threading.ManualResetEventSlim done = new System.Threading.ManualResetEventSlim(false))
@@ -2012,7 +2303,7 @@ namespace Axon
                     catch (Exception ex) { failure = ex; }
                     finally { try { done.Set(); } catch { } }
                 });
-                bool finished = done.Wait(PatternDeadlineMs);
+                bool finished = done.Wait(deadlineMs);
                 if (finished && failure != null) throw failure;
                 return finished;
             }
@@ -2164,9 +2455,12 @@ namespace Axon
                         {
                             Trace(el, "toggle", HwndArg(a));
                             TogglePattern tp2 = p;
-                            if (!RunPattern(delegate { tp2.Toggle(); })) res["slow_provider"] = true;
+                            bool done = RunPattern(delegate { tp2.Toggle(); });
                             res["method"] = "toggle_pattern";
-                            res["toggle"] = p.Current.ToggleState.ToString();
+                            // A provider that did not answer the toggle in time is
+                            // not asked anything else on this thread.
+                            if (!done) res["slow_provider"] = true;
+                            else { try { res["toggle"] = p.Current.ToggleState.ToString(); } catch { } }
                             return res;
                         }
                     }
@@ -2188,10 +2482,13 @@ namespace Axon
                         ExpandCollapsePattern p = el.GetCurrentPattern(ExpandCollapsePattern.Pattern) as ExpandCollapsePattern;
                         if (p != null)
                         {
-                            if (p.Current.ExpandCollapseState == ExpandCollapseState.Collapsed) p.Expand();
-                            else p.Collapse();
+                            ExpandCollapsePattern ep2 = p;
+                            bool collapsed = false;
+                            try { collapsed = p.Current.ExpandCollapseState == ExpandCollapseState.Collapsed; } catch { }
+                            bool done = RunPattern(delegate { if (collapsed) ep2.Expand(); else ep2.Collapse(); });
                             res["method"] = "expand_collapse_pattern";
-                            res["state"] = p.Current.ExpandCollapseState.ToString();
+                            if (!done) res["slow_provider"] = true;
+                            else { try { res["state"] = p.Current.ExpandCollapseState.ToString(); } catch { } }
                             return res;
                         }
                     }
@@ -2200,6 +2497,15 @@ namespace Axon
                 catch { /* fall through to the physical path */ }
             }
 
+            if (Bool(Get(a, "background"), false))
+            {
+                object posted = PostedClick(a, el, button, clicks);
+                if (posted != null) return posted;
+            }
+
+            // Focusing an element in a window that is not in front raises that
+            // window, which the user feels, so the gate runs before it does.
+            NoteWait(res, GuardDisturb(a));
             try { el.SetFocus(); } catch { }
             Trace(el, "click", HwndArg(a));
 
@@ -2278,7 +2584,7 @@ namespace Axon
                         // is not character-for-character what we asked for still
                         // counts as taken. Only a value that did not move at all
                         // means the setter was ignored.
-                        bool moved = after != before;
+                        bool moved = before != null && after != before;
                         if (exact || moved)
                         {
                             res["method"] = "value_pattern";
@@ -2331,6 +2637,24 @@ namespace Axon
             {
                 Target t = ResolveTarget(a);
                 IntPtr want = HwndArg(a);
+                {
+                    IntPtr top = want != IntPtr.Zero ? want : TopWindowOf(t.El);
+                    bool force = Bool(Get(a, "background"), false);
+                    string m = ModeOf(a);
+                    bool inFront = top != IntPtr.Zero && Native.GetForegroundWindow() == top;
+                    if (top != IntPtr.Zero && (force || (!inFront && m != "take" && m != "exclusive")))
+                    {
+                        string how = TryPostText(t.El, top, text, force);
+                        if (how != null)
+                        {
+                            res["method"] = how;
+                            res["typed"] = text.Length;
+                            res["background"] = true;
+                            AddNowState(res, t.El);
+                            return res;
+                        }
+                    }
+                }
                 // Focusing an element in a window that is not in front raises that
                 // window, which the user feels, so it goes through the same gate
                 // as any other foreground change.
@@ -2440,14 +2764,40 @@ namespace Axon
                     }
                     catch { }
                 }
-                try { wheelPoint = ClickPointOf(el); }
-                catch { }
+                // No clickable point means no place to scroll: sending the wheel
+                // anyway would scroll whatever sits under the user's pointer.
+                wheelPoint = ClickPointOf(el);
             }
             else
             {
                 object pt = Get(a, "point");
                 object[] arr = pt as object[];
                 if (arr != null && arr.Length >= 2) wheelPoint = new int[] { Int(arr[0], 0), Int(arr[1], 0) };
+            }
+            if (wheelPoint == null)
+                throw new AxonError("no_target", "Scroll needs an element (index or selector) or a point.",
+                    "A wheel event lands wherever the pointer is, so a target is required.");
+
+            // The wheel goes to the window under the point. If that is not the
+            // target window, the user's own window would scroll instead.
+            {
+                IntPtr top = HwndArg(a);
+                if (top != IntPtr.Zero)
+                {
+                    IntPtr under = Native.RootWindowAt(wheelPoint[0], wheelPoint[1]);
+                    IntPtr topRoot = Native.GetAncestor(top, 2 /* GA_ROOT */);
+                    if (topRoot == IntPtr.Zero) topRoot = top;
+                    if (under != IntPtr.Zero && under != topRoot && !Overlay.IsAnyOverlayWindow(under))
+                    {
+                        string m = ModeOf(a);
+                        if (m != "take" && m != "exclusive")
+                            throw new AxonError("obscured", "That spot is covered by another window, so a wheel event there would scroll the wrong window.",
+                                "Use the element's Scroll pattern if it has one, computer_focus the window first, or pass mode:\"take\".");
+                        NoteWait(res, GuardDisturb(a));
+                        Native.ForceForeground(top);
+                        System.Threading.Thread.Sleep(120);
+                    }
+                }
             }
 
             // The gate comes before the pointer moves. Moving it first and asking
@@ -2461,19 +2811,21 @@ namespace Axon
             Native.POINT scrollSaved;
             bool scrollHaveSaved = Native.GetCursorPos(out scrollSaved);
 
-            if (wheelPoint != null)
+            bool held = Exclusive(a) && Native.BeginExclusive();
+            try
             {
                 Native.SetCursorPos(wheelPoint[0], wheelPoint[1]);
                 System.Threading.Thread.Sleep(16);
+                Native.MouseWheel(amount * 120, horizontal);
             }
-            Native.MouseWheel(amount * 120, horizontal);
+            finally { if (held) Native.EndExclusive(); }
+            if (held) res["input_held"] = true;
             res["method"] = "wheel";
             res["delta"] = amount * 120;
             // Put the pointer back where the user left it, the same courtesy the
             // click path gives. The settle lets the queued wheel dispatch at the
-            // target before the cursor moves off it. Exclusive holds input, so
-            // there is no user pointer to confuse.
-            if (scrollHaveSaved && ModeOf(a) != "exclusive")
+            // target before the cursor moves off it.
+            if (scrollHaveSaved)
             {
                 System.Threading.Thread.Sleep(12);
                 Native.SetCursorPos(scrollSaved.X, scrollSaved.Y);
@@ -2518,12 +2870,15 @@ namespace Axon
                 title = win.Current.Name;
             }
             catch { throw new AxonError("window_gone", "The window disappeared while resolving it.", null); }
+            GuardSameWindow(a, h);
 
             // WM_CLOSE to one specific window. Computer Use has no process-termination
             // op at all: closing a window lets the app run its own save prompts,
             // where killing a process discards unsaved work without asking.
-            Native.SendMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
-            System.Threading.Thread.Sleep(250);
+            // Posted, not sent: a window whose thread is busy - or a packaged
+            // app behind its frame host - must not hold this host hostage.
+            Native.PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
+            for (int i = 0; i < 8 && Native.IsWindow(h); i++) System.Threading.Thread.Sleep(100);
 
             Dictionary<string, object> res = new Dictionary<string, object>();
             res["closed"] = title;
@@ -2539,6 +2894,8 @@ namespace Axon
 
             while (DateTime.UtcNow < deadline)
             {
+                // A Stop press or Escape ends the wait now, not at the timeout.
+                GuardStopped();
                 try
                 {
                     AutomationElement found = FindBySelector(a);
@@ -2683,6 +3040,54 @@ namespace Axon
             if (set != null) { res["set"] = true; res["length"] = set.Length; }
             else { res["has_text"] = got != null; if (got != null) res["text"] = got; }
             return res;
+        }
+
+        // What a target is called, before acting on it - so a click by
+        // selector or by point can be judged for consequences by name.
+        static object OpDescribe(Dictionary<string, object> a)
+        {
+            AutomationElement el = null;
+            object pt = Get(a, "point");
+            if (Get(a, "index") != null || Get(a, "selector") != null) el = ResolveTarget(a).El;
+            else if (pt != null)
+            {
+                object[] arr = pt as object[];
+                if (arr != null && arr.Length >= 2)
+                {
+                    try { el = AutomationElement.FromPoint(new System.Windows.Point(Int(arr[0], 0), Int(arr[1], 0))); }
+                    catch { }
+                }
+            }
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            if (el == null) { res["found"] = false; return res; }
+            res["found"] = true;
+            try { res["name"] = CleanText(NameOf(el)); } catch { }
+            try { res["role"] = RoleOf(el); } catch { }
+            try { res["aid"] = AidOf(el); } catch { }
+            return res;
+        }
+
+        // True while the server is running a batch of steps, so Escape between
+        // two steps still stops the run.
+        static volatile bool _taskActive;
+
+        static object OpBusy(Dictionary<string, object> a)
+        {
+            _taskActive = Bool(Get(a, "on"), false);
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            res["task_active"] = _taskActive;
+            return res;
+        }
+
+        static bool IsActingOp(string op)
+        {
+            switch (op)
+            {
+                case "click": case "type": case "set_value": case "key": case "scroll":
+                case "focus": case "close_window":
+                    return true;
+            }
+            return false;
         }
 
         static object OpPing()

@@ -2,8 +2,15 @@
 // concurrent builds, and cleanup of superseded binaries.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { ensureHost, binDir } from '../server/build.mjs';
+
+// This suite deletes the bin directory. A live Claude Code session runs its
+// host from the shared one, so the test builds into a directory of its own.
+const PRIVATE = path.join(os.tmpdir(), `cu-build-test-${process.pid}`);
+process.env.CU_PLUGIN_DATA = PRIVATE;
+const { ensureHost, binDir } = await import('../server/build.mjs');
+process.on('exit', () => { try { fs.rmSync(PRIVATE, { recursive: true, force: true }); } catch {} });
 
 let pass = 0, fail = 0; const failures = [];
 const check = (n, c, d) => {

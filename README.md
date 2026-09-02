@@ -215,6 +215,78 @@ And the tree is not just cheaper, it is better:
 Pixels still win for canvas apps — image editors, games, charts, design tools —
 so `computer_screenshot` is there. It is just not the default any more.
 
+## Reading a window twice costs almost nothing
+
+The expensive part of computer use is not the first read, it is the fifth.
+Read, act, read again to see what happened, act, read again: every one of
+those reads used to cost the whole tree.
+
+In 0.3.0 every element keeps its index for as long as it exists, keyed on the
+accessibility RuntimeId. So a second read of the same window says only what
+moved:
+
+```
+s7 "Calculator" hwnd=2624072 | changes since s6: +0 ~3 -1, 48 same | 54ms
+
+~ [6]  Text "Display is 25" #CalculatorResults
+~ [31] Button "Five" #num5Button {focused}
+- [44] Text "Expression is 9 × 6="
+```
+
+| read | tokens |
+|---|---:|
+| first read of a window | ~400 |
+| re-read, nothing changed | **~26** |
+| re-read, one control changed | **~33** |
+
+And an index seen once can be acted on for the rest of the task, without a
+snapshot id and without reading again. `find: "save"` returns only the rows
+that match a word or a `/regex/`; `index: 12` reads one subtree; `full: true`
+asks for the whole listing again.
+
+## Several steps, one call
+
+```
+computer_run { hwnd, steps: [
+  { click: { selector: { automation_id: "num9Button" } } },
+  { click: { selector: { automation_id: "multiplyButton" } } },
+  { click: { selector: { automation_id: "num6Button" } } },
+  { click: { selector: { automation_id: "equalButton" } } },
+  { wait_for: { text: "Display is 54" } }
+] }
+```
+
+Six steps, one round trip, 822 ms, and the result ends with the delta since the
+run began. It stops at the first failure and says which steps did not run.
+Every step goes through the same gate a single call would - grant, tier, the
+send/pay/delete confirmation, the input lease between Claude sessions.
+
+`background: true` returns a task id at once. Claude goes on reading another
+window or running a shell command while the desktop side proceeds;
+`computer_task` reports progress, waits, or cancels. That is what lets you and
+Claude each get on with your own work at the same time.
+
+`computer_wait_for` now waits for what matters: `text` appearing (or going),
+`change: true` (the window differs from what Claude last read - the answer is
+the delta), `new_window: true` (a dialog opened), or a selector appearing or
+`gone`. Every action also reports a window that appeared during it.
+
+## Typing into the window behind yours
+
+`computer_type { index, text }` on a window that is not in front posts the
+characters straight to the control - the same messages a keystroke produces
+after translation - reads the control back to confirm, and only falls back to
+real keystrokes when the control ignored them. No focus change, no raise, no
+cursor. `via posted` in the result means your window never moved.
+
+`computer_launch { app: "notepad" }` starts an app and waits for its window,
+the way Codex's `launch_app` does. Shells are refused, Windows-key chords are
+refused, and the Run dialog reads as a terminal, because all three are the
+command line by another door.
+
+`node tools/cli.mjs snapshot '{"title":"Notepad"}'` drives the server from a
+shell against your real windows and prints what each call cost.
+
 ## Install
 
 ```
@@ -293,8 +365,8 @@ result says `exclusive_unavailable`. Escape releases it regardless. It is
 opt-in and never the default, precisely because a locked-out user cannot reach
 the Stop button — Escape is why it is safe to offer at all.
 
-Thirteen tools, about **1,650 tokens** of always-on cost. One screenshot you did
-not take pays for that six times over.
+Sixteen tools, about **2,300 tokens** of always-on cost. One screenshot you did
+not take pays for that four times over.
 
 ### Clipboard
 
@@ -337,6 +409,12 @@ Your Claude Code session is excluded from its own listings, so text on your
 screen cannot loop back into the model as if it had observed it. Add your own
 blocked apps in the plugin settings; that list only ever grows.
 
+A few knobs live only in the environment of the Claude Code process, for
+people debugging the host: `CU_OVERLAY=off` hides the on-screen marker and
+banner, `CU_PRESENCE=off` disables the input hooks, `CU_WAIT_MS` is how long
+`share` mode waits for you to pause (default 6000), `CU_SNAPSHOT_MS` is the
+wall clock for one read (default 8000).
+
 ## What it does not do
 
 - **Linux.** Would need an AT-SPI driver. Does not exist yet.
@@ -367,14 +445,15 @@ will fix it.
 ## Tests
 
 ```
-node tools/test-all.mjs        all 320
+node tools/test-all.mjs        every suite below
 node tools/verify.mjs           33  drives real windows end to end, cursor never moves
 node tools/policy-test.mjs      70  tiers, grants, refusals, what needs confirming
 node tools/sessions-test.mjs    48  two Claudes: slots, the input lease, dead sessions
 node tools/presence-test.mjs    32  telling you apart from Computer Use, overlay, banner
 node tools/build-test.mjs       13  compile, idempotence, concurrent builds
 node tools/host-test.mjs        57  tree, patterns, input, crash recovery
-node tools/mcp-test.mjs         67  the protocol end to end, prints token costs
+node tools/mcp-test.mjs         66  the protocol end to end, prints token costs
+node tools/batch-test.mjs       66  stable indices, deltas, find, waits, runs, tasks, posted input, launch
 
 and one that is deliberately not in that run, because it moves your screen:
 

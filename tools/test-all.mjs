@@ -21,6 +21,7 @@ const suites = [
   'presence-test.mjs',
   'host-test.mjs',
   'mcp-test.mjs',
+  'batch-test.mjs',
 ];
 
 async function sweepStrayWindows() {
@@ -31,9 +32,14 @@ async function sweepStrayWindows() {
     await d.start();
     const wins = (await d.call('list_apps', { include_hidden: true })).result.windows;
     for (const w of wins) {
-      if ((w.title || '').includes('Computer Use Test Target')) {
-        try { await d.call('close_window', { hwnd: w.hwnd, mode: 'take' }); } catch {}
-      }
+      const m = /Computer Use Test Target (\d+)/.exec(w.title || '');
+      if (!m) continue;
+      // A target whose owning script is still alive belongs to a run in
+      // progress - possibly another session's - and is left alone.
+      let alive = false;
+      try { process.kill(Number(m[1]), 0); alive = true; } catch (err) { alive = !!(err && err.code === 'EPERM'); }
+      if (alive) continue;
+      try { await d.call('close_window', { hwnd: w.hwnd, mode: 'take' }); } catch {}
     }
     await d.stop();
   } catch {}
