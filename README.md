@@ -306,6 +306,18 @@ after translation - reads the control back to confirm, and only falls back to
 real keystrokes when the control ignored them. No focus change, no raise, no
 cursor. `via posted` in the result means your window never moved.
 
+Clicking is the honest exception, and `tools/fg-probe.mjs` measures it. Reading
+a window never disturbs anything, and posted typing never does. But a click
+through a control's own accessibility pattern - Invoke on a button, Toggle on a
+checkbox - and a `replace: true` write both bring the window to the front on
+WinForms, because the framework focuses the control it is acting on before
+doing the work. That is the framework, not this plugin, and it is the same for
+a single call and for a step inside a run; `background: true` does not avoid it
+either. Other toolkits route pattern actions differently, so run the probe
+against the app you care about rather than assuming. Until then: if your
+foreground matters, Claude can read and type behind you all day, and a click
+may surface the window.
+
 `computer_launch { app: "notepad" }` starts an app and waits for its window,
 the way Codex's `launch_app` does. Shells are refused, Windows-key chords are
 refused, and the Run dialog reads as a terminal, because all three are the

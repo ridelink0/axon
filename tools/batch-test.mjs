@@ -200,6 +200,19 @@ async function main() {
   check('typing into the window behind uses the posted path', !typed.isError && /via posted/.test(body(typed)), body(typed));
   const after = body(await c.call('computer_snapshot', { hwnd, find: 'Name field' }));
   check('the posted text is in the field', after.includes('posted hello'), after);
+  // Checked HERE, after the typing and before the click. Posted typing is the
+  // one input path that provably leaves the stacking order alone; a click does
+  // not, even posted - WinForms focuses the control it is about to press, and
+  // focusing a control activates its window. tools/fg-probe.mjs measures which
+  // is which per toolkit.
+  const fgQuiet = body(await c.call('computer_apps')).split('\n').find((l) => l.includes('[foreground]')) || '';
+  if (fgQuiet.includes(String(hwnd2)) || fgQuiet.includes(String(hwnd))) {
+    check('posted typing left the window behind', fgQuiet.includes(String(hwnd2)), fgQuiet);
+  } else {
+    // Windows would not give a test target the foreground: the user is at the
+    // machine. Nothing to compare against, and their foreground is not a bug.
+    console.log('     (the user holds the foreground; stacking not verifiable)');
+  }
   const st1 = body(await c.call('computer_status'));
   const pc = body(await c.call('computer_click', { hwnd, index: iPress, physical: true, background: true }));
   check('background:true physical click is posted', pc.includes('posted_click'), pc);
@@ -211,17 +224,27 @@ async function main() {
   } else {
     check('posted click pressed the button', after2.includes('pressed:4'), after2 + '\n' + pc);
   }
-  const fg = body(await c.call('computer_apps')).split('\n').find((l) => l.includes('[foreground]')) || '';
-  check('the window behind stayed behind', fg.includes(String(hwnd2)), fg);
-
   console.log('\n-- runs --');
+  // The run section is about run mechanics, so it starts from a known
+  // foreground. Leaving the previous section's window in front made step 4
+  // (a key chord, which needs the window in front) race the foreground and
+  // fail for reasons that say nothing about runs.
+  await c.call('computer_focus', { hwnd, mode: 'take' });
+  await sleep(300);
+  const runFg = body(await c.call('computer_apps')).split('\n').find((l) => l.includes('[foreground]')) || '';
+  // The last step is a key chord, and a chord needs the window in front. If
+  // the user is at the machine Windows will not grant that, and the failure
+  // would be theirs, not the run's - so drop the chord and test the rest.
+  const chord = runFg.includes(String(hwnd)) ? [{ key: 'tab' }] : [];
+  if (!chord.length) console.log('     (the user holds the foreground; testing the run without its key step)');
   const run1 = body(await c.call('computer_run', { hwnd, steps: [
     { type: { index: iName, text: 'from a run', replace: true } },
     { click: { index: iAgree } },
     { wait_for: { text: 'from a run' } },
-    { key: 'tab' },
+    ...chord,
   ] }));
-  check('run executes every step', /4\/4 step\(s\) ran, all ok/.test(run1), run1);
+  const wanted = 3 + chord.length;
+  check('run executes every step', new RegExp(`${wanted}/${wanted} step\\(s\\) ran, all ok`).test(run1), run1);
   check('run lines are compact', run1.split('\n').filter((l) => /^\d+ /.test(l)).every((l) => l.length < 260), run1);
   check('run ends with what changed', run1.includes('after the run:') && run1.includes('from a run'), run1);
   // The Disabled button never changes, so it appears only in a full listing.
@@ -249,6 +272,48 @@ async function main() {
   const many = Array.from({ length: 41 }, () => ({ sleep: 1 }));
   const run7 = await c.call('computer_run', { hwnd, steps: many });
   check('more than 40 steps is refused', run7.isError && body(run7).includes('too_many_steps'), body(run7));
+
+  // A whole sequence must be able to run on a window that is not in front.
+  // Batching would be worth much less if it cost the user their foreground:
+  // set_value writes through the value pattern and a checkbox toggles through
+  // its own pattern, so neither needs focus, a cursor, or a raise.
+  console.log('\n-- a run works behind another window --');
+  await c.call('computer_focus', { hwnd: hwnd2, mode: 'take' });
+  await sleep(300);
+  const foreground = async () => {
+    const line = body(await c.call('computer_apps')).split('\n').find((l) => l.includes('[foreground]'));
+    return line || '';
+  };
+  const fgBefore = await foreground();
+  // The two quiet paths only: posted typing (no replace) and a click that goes
+  // through the element's own toggle pattern. replace:true is deliberately not
+  // here - WinForms focuses a text box when its value is set through the value
+  // pattern, which activates the window, for a single call just as much as for
+  // a step in a run.
+  const behind = body(await c.call('computer_run', { hwnd, read_after: false, steps: [
+    { type: { index: iName, text: 'behind you' } },
+    { click: { index: iAgree } },
+    { snapshot: { find: 'behind you' } },
+  ] }));
+  check('every background-safe step ran', /3\/3 step\(s\) ran, all ok/.test(behind), behind);
+  check('nothing was typed with real keystrokes', !/waited \d+ms for the user/i.test(behind), behind);
+  const landed = body(await c.call('computer_snapshot', { hwnd, find: 'Name field' }));
+  check('the text landed in the window behind', landed.includes('behind you'), landed);
+  // Whether the foreground moved is REPORTED, not asserted, and the reason is
+  // worth knowing. WinForms' own UIA provider focuses a control when it is
+  // toggled or has its value set, and focusing a control activates its window.
+  // That is the provider, not this plugin: a single computer_click on the same
+  // checkbox raises exactly as much as the same click inside a run. Asserting
+  // here would be asserting something about WinForms. The plugin's own quiet
+  // guarantee - no cursor moved, no keystrokes sent, the text delivered to a
+  // window that is not in front - is what the three checks above establish.
+  const fgAfter = await foreground();
+  if (fgBefore && fgAfter !== fgBefore) {
+    console.log('     (note: the target app took the foreground during the run;');
+    console.log('      WinForms focuses a control on toggle/set-value, single calls do the same)');
+  } else if (fgBefore) {
+    console.log('     (the foreground did not move)');
+  }
 
   console.log('\n-- shell doors stay shut --');
   const winKey = await c.call('computer_key', { hwnd, keys: 'win+r' });

@@ -174,11 +174,16 @@ The user is probably working on this same desktop. Computer Use tells its own
 input from theirs (the OS flags every synthetic event) and gates only the two
 things they can feel: moving the pointer and taking the foreground.
 
-- **Pattern actions touch nothing.** `computer_click` on a control with an
-  Invoke, Toggle, SelectionItem or ExpandCollapse pattern, and
-  `computer_type { replace: true }`, act through the accessibility API: no
-  cursor, no focus change, the window stays where it is in the stack. Prefer
-  them, always; they work on a window behind the one the user is using.
+- **Pattern actions move no cursor**, and they work on a window behind the one
+  the user is using: `computer_click` on a control with an Invoke, Toggle,
+  SelectionItem or ExpandCollapse pattern, and `computer_type { replace: true }`,
+  act through the accessibility API rather than the mouse. Prefer them always.
+  They do not always leave the window *where it is in the stack*, though -
+  measured on WinForms, a pattern click and a `replace: true` write both bring
+  the window to the front, because the framework focuses the control it is
+  acting on. Reads never do, and posted typing never does (next point). So if
+  the user must keep their foreground, read and type freely, and expect a click
+  to surface the window.
 - **Typing into a window behind the user's** is also quiet: `computer_type
   { index, text }` on a window that is not in front posts the characters
   straight to the control, reads the control back to confirm, and only falls

@@ -563,6 +563,17 @@ func opType(_ a: [String: Any]) throws -> [String: Any] {
                 "Could not put the keyboard focus on that element, so the text would have gone to whatever window is in front instead.",
                 "Use replace:true, which writes through the element's value attribute and needs no focus at all.")
         }
+        // AXFocused is focus *within* its own app. An element in a background
+        // app can hold it while the keystrokes below - which go to the system
+        // event tap - land in whatever app is actually in front. Windows avoids
+        // this by posting straight to the control and reading it back; there is
+        // no equivalent here, so refuse rather than type into the wrong app.
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        if front != pid {
+            throw AxonError("background_unavailable",
+                "That element is in an app that is not in front, and plain typing goes wherever the keyboard focus is, so the text would land in another app.",
+                "Use replace:true, which writes through the element's value attribute without focus and leaves the window where it is, or focus the window first.")
+        }
     } else {
         let waited = try guardDisturb(a)
         if waited > 0 { res["waited_for_user_ms"] = waited }
