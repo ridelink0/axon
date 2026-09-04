@@ -13,10 +13,27 @@ import { Policy, classify, isConsequential, TIER } from './policy.mjs';
 import { renderSnapshot, renderApps, buildRows, renderDelta, diffRows, subtreeNodes, findMatcher, nodeMatches, leanNodes } from './render.mjs';
 import { profileHint } from './profiles.mjs';
 import { Sessions, LeaseBusy } from './sessions.mjs';
-import { Tasks } from './tasks.mjs';
+import { Tasks, validateSteps } from './tasks.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-const SERVER_INFO = { name: 'computer-use', version: '0.3.0' };
+const SERVER_INFO = { name: 'computer-use', version: '0.4.0' };
+
+// Claude Code puts a server's instructions in front of the model at the start
+// of every session, before any tool schema has been loaded. For a deferred
+// plugin this is the only text that is always there, so it carries the one
+// thing the tool descriptions cannot say on their own: act in sequences, not
+// one call at a time. Kept byte-stable (no versions, handles or grant state)
+// so it does not break the prompt cache, and well inside the 2 KB Claude Code
+// truncates each server's instructions at.
+const INSTRUCTIONS = [
+  'Drives desktop apps through the accessibility tree. Read the computer-use skill before using it.',
+  'Loop: computer_apps for the window handle, computer_snapshot to read it (indices stay valid),',
+  'computer_grant once per app, then computer_run { hwnd, steps: [...] } for every stretch of actions',
+  'you can already name - click, type, key, scroll, wait_for, snapshot - in ONE call.',
+  'A run executes its steps in order, stops at the first failure, and ends with what changed.',
+  'A single computer_click, computer_type or computer_key call is only for one action whose result',
+  'you must see before you can choose the next one.',
+].join(' ');
 
 // Other Claude Code sessions driving this same desktop. Registered before the
 // host starts, so the banner knows which slot it owns and never lands on top of
@@ -85,12 +102,20 @@ async function syncSessionUi() {
 // Tool definitions
 // ---------------------------------------------------------------------------
 
-// Schemas are always-on context: every turn pays for them whether or not Computer Use
-// is used. So they stay terse, and all teaching lives in the skill, which is
-// only paid for when it is actually invoked.
+// Claude Code defers these schemas: only the tool names are always-on, and a
+// schema is fetched by tool search on first use and again after a compaction.
+// So descriptions stay terse and point every sequence at computer_run; all the
+// teaching lives in the skill, which is only paid for when it is invoked.
 const int = { type: 'integer' };
 const str = { type: 'string' };
 const bool = { type: 'boolean' };
+
+// Claude Code decides whether it may run two MCP calls at the same time from
+// this annotation alone, defaulting to no. Reads are safe to overlap - they
+// send no input and take no lease - so several windows can be read in one
+// turn. Everything that acts is deliberately left unmarked: those must stay
+// serial, and a sequence of them belongs in computer_run, not in one message.
+const READ_ONLY = { readOnlyHint: true };
 
 const SELECTOR = {
   type: 'object',
@@ -120,6 +145,7 @@ const TOOLS = [
   {
     name: 'computer_apps',
     description: 'List visible windows with handle, app, and safety tier. Start here.',
+    annotations: READ_ONLY,
     inputSchema: { type: 'object', properties: { include_hidden: bool } },
   },
   {
@@ -130,6 +156,7 @@ const TOOLS = [
   {
     name: 'computer_snapshot',
     description: 'Read a window as an indexed semantic tree (roles, names, ids, states, text including text scrolled out of view). Indices are stable per window; a repeat read returns only what changed. ~15x cheaper than a screenshot. Browsers: shows the page, its URL and tabs.',
+    annotations: READ_ONLY,
     inputSchema: { type: 'object', properties: {
       hwnd: int, title: str,
       interactive_only: { type: 'boolean', description: 'Actionable elements only. Smaller.' },
@@ -146,6 +173,7 @@ const TOOLS = [
   {
     name: 'computer_screenshot',
     description: 'Capture pixels. Only for canvas UI, charts, games, or visual checks; anything with a tree is cheaper via computer_snapshot.',
+    annotations: READ_ONLY,
     inputSchema: { type: 'object', properties: { hwnd: int, title: str, max_width: int, quality: int } },
   },
   {
@@ -163,7 +191,7 @@ const TOOLS = [
   },
   {
     name: 'computer_click',
-    description: 'Click an element. Uses its accessibility pattern when it has one (no cursor movement, works when partly covered), else a real click.',
+    description: 'Click one element. Uses its accessibility pattern when it has one (no cursor movement, works when partly covered), else a real click. For this click plus the steps you already know follow it, use computer_run instead - one call, not one each.',
     inputSchema: { type: 'object', properties: {
       ...TARGET,
       button: { type: 'string', enum: ['left', 'right', 'middle'] },
@@ -174,17 +202,17 @@ const TOOLS = [
   },
   {
     name: 'computer_type',
-    description: 'Type text. replace:true clears the field first via its value pattern - use that for text boxes. A window that is not in front is typed into without raising it.',
+    description: 'Type text into one field. replace:true clears the field first via its value pattern - use that for text boxes. A window that is not in front is typed into without raising it. If a key, click or wait already comes next, put this and those in one computer_run call.',
     inputSchema: { type: 'object', required: ['text'], properties: { ...TARGET, text: str, replace: bool } },
   },
   {
     name: 'computer_key',
-    description: 'Send one key chord: "ctrl+s", "alt+f4", "enter", "f5".',
+    description: 'Send one key chord: "ctrl+s", "alt+f4", "enter", "f5". A chord that is part of a sequence (ctrl+l, type a URL, enter) belongs in one computer_run call.',
     inputSchema: { type: 'object', required: ['keys', 'hwnd'], properties: { keys: str, hwnd: int, mode: MODE } },
   },
   {
     name: 'computer_scroll',
-    description: 'Scroll an element or the cursor point. Negative is down.',
+    description: 'Scroll an element or the cursor point. Negative is down. Scroll-then-read-then-click belongs in one computer_run call.',
     inputSchema: { type: 'object', properties: { ...TARGET, amount: int, horizontal: bool } },
   },
   {
@@ -196,7 +224,7 @@ const TOOLS = [
   },
   {
     name: 'computer_run',
-    description: 'Run several steps in one call, stopping at the first failure, then report what changed. steps: [{click:{index:5}}, {type:{index:2,text:"x",replace:true}}, {key:"enter"}, {wait_for:{text:"Saved"}}, {scroll:{index:9,amount:-3}}, {snapshot:{find:"Total"}}, {sleep:500}]. background:true returns a task id at once so you can do other work meanwhile.',
+    description: 'The normal way to act: a batch of steps in ONE call - click, type, key, scroll, wait_for, snapshot, sleep, focus - run in order, stopping at the first failure, ending with what changed. Use it for every sequence you can already name, e.g. steps: [{key:"ctrl+l"}, {type:"https://..."}, {key:"enter"}, {wait_for:{change:true}}]. A step may add hwnd, title or window:"new" to act on another window, optional:true to survive a failure, repeat:N to repeat. Steps pass the same gate a single call would.',
     inputSchema: { type: 'object', required: ['steps'], properties: {
       hwnd: int, title: str,
       steps: { type: 'array', items: { type: 'object' } },
@@ -223,6 +251,7 @@ const TOOLS = [
   {
     name: 'computer_status',
     description: 'Host health, DPI mode, grants, running tasks, and token spend this session.',
+    annotations: READ_ONLY,
     inputSchema: { type: 'object', properties: {} },
   },
 ];
@@ -236,7 +265,9 @@ function text(s) { return { content: [{ type: 'text', text: s }] }; }
 function fail(code, message, hint) {
   let s = `error ${code}: ${message}`;
   if (hint) s += `\nhint: ${hint}`;
-  return { content: [{ type: 'text', text: s }], isError: true };
+  // The code rides along on the result object as well as in the text, so a run
+  // can branch on it - a Stop is terminal - without parsing its own output.
+  return { content: [{ type: 'text', text: s }], isError: true, code };
 }
 
 function failCheck(c) { return fail(c.code, c.message, c.hint); }
@@ -932,45 +963,104 @@ const handlers = {
     }
     if (steps.length > 40) return fail('too_many_steps', `${steps.length} steps; the limit is 40.`, 'Split the work into two runs.');
     const hwnd = Number(win.hwnd);
+
+    // Every step is checked before any of them runs. A run that half-happens
+    // and then reports a typo in step five is worse than no run at all: the
+    // window has moved and the model cannot tell how far.
+    const background = !!args.background;
+    const v = validateSteps(steps, { background });
+    if (v.errors.length) {
+      return fail('invalid_steps', v.errors.join('\n'),
+        'Nothing ran. Fix the steps listed above and call again.');
+    }
+    if (v.expanded > 100) {
+      return fail('too_many_steps', `${v.expanded} step executions once repeats are counted; the limit is 100.`,
+        'Lower the repeat counts, or split the work into two runs.');
+    }
     budget.runs++;
+
+    // What was on screen before the run, so a step that says window:"new" can
+    // be aimed at the dialog this run itself opened. Only worth a window
+    // listing when a step actually asks for it; every other run skips it.
+    const before = v.plan.some((s) => s.target && s.target.window === 'new')
+      ? await windowSet() : null;
+    let opened = null;
+
+    const resolveWindow = async (target) => {
+      if (target.hwnd != null) {
+        const w = await windowFor({ hwnd: target.hwnd });
+        if (!w) return { error: `error window_not_found: no window with hwnd ${target.hwnd}.` };
+        return { hwnd: Number(w.hwnd), title: w.title };
+      }
+      if (target.title) {
+        const w = await windowFor({ title: target.title });
+        if (!w) return { error: `error window_not_found: no window titled ${JSON.stringify(target.title)}.` };
+        return { hwnd: Number(w.hwnd), title: w.title };
+      }
+      // window:"new" - whatever opened since the run began. Remembered once,
+      // so later steps keep talking to the same dialog even if something else
+      // appears behind it half way through.
+      if (opened) {
+        if (await windowFor({ hwnd: opened.hwnd })) return opened;
+        opened = null;
+      }
+      const appeared = await newWindowsSince(before);
+      if (!appeared.length) {
+        return { error: 'error no_new_window: nothing has opened since this run began.' };
+      }
+      const pick = appeared.find((w) => w.foreground) || appeared[appeared.length - 1];
+      opened = { hwnd: Number(pick.hwnd), title: pick.title };
+      return opened;
+    };
 
     const call = async (kind, a) => {
       const fn = STEP_HANDLERS[kind];
       try {
         const r = await fn(a);
-        return { text: bodyOf(r), isError: !!r.isError };
+        return { text: bodyOf(r), isError: !!r.isError, code: r.code };
       } catch (err) {
-        return { text: bodyOf(errorResult(err)), isError: true };
+        const e = errorResult(err);
+        return { text: bodyOf(e), isError: true, code: e.code };
       }
     };
     // The closing read repeats the view of the last read, so it comes back as
-    // a delta; with no earlier read it is a controls-only listing.
-    const after = async () => {
-      const prev = lastRead.get(hwnd);
-      const r = await handlers.computer_snapshot({ hwnd, ...(prev ? prev.args : { interactive_only: true }) });
-      return 'after the run:\n' + bodyOf(r);
+    // a delta; with no earlier read it is a controls-only listing. A run whose
+    // last step acted on a dialog is read where it ended, not where it began.
+    const after = async (r) => {
+      let closeHwnd = hwnd;
+      let elsewhere = false;
+      if (r && r.lastHwnd && Number(r.lastHwnd) !== hwnd && await windowFor({ hwnd: r.lastHwnd })) {
+        closeHwnd = Number(r.lastHwnd);
+        elsewhere = true;
+      }
+      const prev = lastRead.get(closeHwnd);
+      const snap = await handlers.computer_snapshot({ hwnd: closeHwnd, ...(prev ? prev.args : { interactive_only: true }) });
+      return (elsewhere ? `after the run (in "${r.lastTitle}", hwnd ${closeHwnd}):\n` : 'after the run:\n') + bodyOf(snap);
     };
+    const ctx = { hwnd, title: win.title, resolveWindow };
     const opts = { stopOnError: args.stop_on_error !== false };
 
-    if (args.background) {
+    if (background) {
       await runBusy(true);
-      const task = tasks.start(steps, hwnd, win.title, call, { ...opts, after: args.read_after === false ? null : after });
+      const task = tasks.start(v.plan, ctx, call, { ...opts, after: args.read_after === false ? null : after });
       task.promise.finally(() => runBusy(false));
       return text(sessions.note(hwnd) +
-        `task ${task.id} started: ${steps.length} step(s) on "${win.title}" (hwnd ${hwnd}). ` +
+        `task ${task.id} started: ${v.expanded} step(s) on "${win.title}" (hwnd ${hwnd}). ` +
         `It runs while you do other work; check it with computer_task { id: "${task.id}" }, or computer_task { id: "${task.id}", wait_ms: 30000 } to wait for it. ` +
         `Do not act on this window yourself until it finishes.`);
     }
 
     await runBusy(true);
     let r;
-    try { r = await tasks.runSteps(steps, hwnd, call, opts); }
+    try { r = await tasks.runSteps(v.plan, ctx, call, opts); }
     finally { await runBusy(false); }
     let out = sessions.note(hwnd) +
-      `run on "${win.title}" (hwnd ${hwnd}): ${r.ran}/${steps.length} step(s) ran, ${r.failed ? r.failed + ' failed' : 'all ok'}\n` +
+      `run on "${win.title}" (hwnd ${hwnd}): ${r.ran}/${v.expanded} step(s) ran, ${r.failed ? r.failed + ' failed' : 'all ok'}` +
+      (r.optionalFailed ? ` (${r.optionalFailed} optional failed)` : '') + '\n' +
       r.lines.join('\n');
+    if (r.touched.size > 1) out += `\nwindows touched: ${[...r.touched].join(', ')}`;
     if (args.read_after !== false) {
-      try { out += '\n\n' + await after(); }
+      try { out += '\n\n' + await after(r); }
       catch (err) { out += `\n\n(no closing read: ${err && err.message})`; }
     }
     return text(out);
@@ -1181,6 +1271,7 @@ async function handleMessage(msg) {
       protocolVersion: version,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
+      instructions: INSTRUCTIONS,
     });
     return;
   }

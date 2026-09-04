@@ -7,11 +7,34 @@
 // confirmation gate, same input lease - stopping at the first failure. Run in
 // the background, it returns a task id at once so the model can do other work
 // while the desktop side proceeds.
+//
+// This is the only way a sequence can be one round trip. Several tool calls in
+// one message will not do it: Claude Code runs them in the order they were
+// written but does not stop when one fails, so a click that missed is still
+// followed by the typing that depended on it. Anthropic's own computer-use
+// toolset defines the contract followed here - run in order, stop at the first
+// failure, and report every step that did not run rather than dropping it.
 
 const STEP_KINDS = ['click', 'type', 'key', 'scroll', 'wait_for', 'snapshot', 'sleep', 'focus'];
 
-// Normalises one step object into { kind, args }. Accepts the short forms
-// {key:"ctrl+s"} and {sleep:500} as well as the object forms.
+// Per-step fields that change how a step runs rather than what it does.
+const STEP_EXTRAS = ['confirmed', 'mode', 'background', 'physical'];
+
+// A step may name its own window. Without one it runs on the run's window.
+const TARGET_KEYS = ['hwnd', 'title', 'window'];
+
+const REPEAT_MAX = 20;
+
+// Anthropic's wording for a step a batch never reached. Claude is trained on
+// this sentence, so it reads as "replan from here", not as a second failure.
+export const HALT_FAILED = 'Not executed: an earlier computer action in this turn failed.';
+export const HALT_CANCELLED = 'Not executed: the run was cancelled.';
+export const HALT_STOPPED = 'Not executed: the user pressed Stop.';
+
+// Normalises one step object into { kind, args, target, optional, repeat }.
+// Accepts the short forms {key:"ctrl+s"} and {sleep:500} as well as the object
+// forms. Throws on anything malformed, which is how a run is checked before
+// any of it runs.
 export function parseStep(step, n) {
   if (!step || typeof step !== 'object' || Array.isArray(step)) {
     throw new Error(`step ${n} must be an object such as {click:{index:5}}`);
@@ -28,10 +51,87 @@ export function parseStep(step, n) {
   if (kind === 'wait_for' && typeof v === 'string') v = { text: v };
   if (v === true || v == null) v = {};
   if (typeof v !== 'object') throw new Error(`step ${n}: ${kind} takes an object`);
-  // Per-step overrides such as confirmed, mode or background live on the step.
+
+  const args = { ...v };
+  // A target may be written on the step or inside the kind object; both mean
+  // the same window. Either way it has to come out of args, or the runner's
+  // own hwnd would silently overwrite it.
+  const target = {};
+  for (const k of TARGET_KEYS) {
+    if (step[k] !== undefined) target[k] = step[k];
+    if (args[k] !== undefined) { target[k] = args[k]; delete args[k]; }
+  }
+  const named = Object.keys(target);
+  if (named.length > 1) {
+    throw new Error(`step ${n}: name the window once - hwnd, title or window:"new", not ${named.join(' and ')}`);
+  }
+  if (target.hwnd !== undefined && !(Number.isInteger(Number(target.hwnd)) && Number(target.hwnd) > 0)) {
+    throw new Error(`step ${n}: hwnd must be a window handle from computer_apps`);
+  }
+  if (target.title !== undefined && !(typeof target.title === 'string' && target.title.trim())) {
+    throw new Error(`step ${n}: title must be the text in a window's title bar`);
+  }
+  if (target.window !== undefined && target.window !== 'new') {
+    throw new Error(`step ${n}: window takes only "new" - the window that opened during this run`);
+  }
+
+  const optional = step.optional;
+  if (optional !== undefined && typeof optional !== 'boolean') {
+    throw new Error(`step ${n}: optional is true or false`);
+  }
+  let repeat = 0;
+  if (step.repeat !== undefined) {
+    repeat = Number(step.repeat);
+    if (!(Number.isInteger(repeat) && repeat >= 1 && repeat <= REPEAT_MAX)) {
+      throw new Error(`step ${n}: repeat must be a whole number from 1 to ${REPEAT_MAX}`);
+    }
+  }
+  if (kind === 'sleep' && !Number.isFinite(Number(args.ms))) {
+    throw new Error(`step ${n}: sleep takes milliseconds, as {sleep:500}`);
+  }
+
   const extras = {};
-  for (const k of ['confirmed', 'mode', 'background', 'physical']) if (step[k] !== undefined) extras[k] = step[k];
-  return { kind, args: { ...extras, ...v } };
+  for (const k of STEP_EXTRAS) if (step[k] !== undefined) extras[k] = step[k];
+  return {
+    kind,
+    args: { ...extras, ...args },
+    target: named.length ? target : null,
+    optional: optional === true,
+    repeat,
+  };
+}
+
+// Checks every step and expands repeats into the flat plan the runner walks.
+// Nothing runs until this returns no errors, so a typo in step five cannot
+// leave steps one to four done and the window half-changed.
+export function validateSteps(steps, { background = false } = {}) {
+  const plan = [];
+  const errors = [];
+  for (let i = 0; i < steps.length; i++) {
+    const n = i + 1;
+    let parsed;
+    try {
+      parsed = parseStep(steps[i], n);
+    } catch (err) {
+      const msg = String(err && err.message ? err.message : err)
+        .replace(new RegExp(`^step ${n}\\s*:?\\s*`), '');
+      errors.push(`step ${n} INVALID: ${msg}`);
+      continue;
+    }
+    // A background run finishes with nobody watching. Letting it carry the
+    // answer to a confirmation would let one call complete a send, a payment
+    // or a deletion with no human in the loop at any point.
+    if (background && parsed.args.confirmed === true) {
+      errors.push(`step ${n} INVALID: confirmed:true is refused in a background run - `
+        + 'run a send, payment or deletion in the foreground, where the user is answering.');
+      continue;
+    }
+    const times = parsed.repeat || 1;
+    for (let r = 0; r < times; r++) {
+      plan.push({ n, rep: parsed.repeat ? r + 1 : 0, ...parsed });
+    }
+  }
+  return { plan, errors, expanded: plan.length };
 }
 
 // One line about a step, from the handler's text. Presence and peer-listing
@@ -62,71 +162,125 @@ function describeStep(kind, args) {
   return kind;
 }
 
+// The step's number as the caller wrote it, plus which pass of a repeat this
+// is. Authored numbering throughout, so "step 3 failed" means the third step
+// in the array the model sent, however many times step 2 ran.
+function stepLabel(entry) {
+  const rep = entry.rep ? ` x${entry.rep}/${entry.repeat}` : '';
+  return `${entry.n}${rep} ${describeStep(entry.kind, entry.args)}`;
+}
+
 export class Tasks {
   constructor() {
     this.seq = 0;
     this.tasks = new Map();
   }
 
-  // Executes steps in order. `call(kind, args)` runs one step through the
-  // server's own handler and returns { text, isError }. Snapshot steps keep
-  // their full text; everything else is one line.
-  async runSteps(steps, hwnd, call, { stopOnError = true, task = null } = {}) {
+  // Executes a validated plan in order. `call(kind, args)` runs one step
+  // through the server's own handler and returns { text, isError, code }.
+  // `ctx.resolveWindow(target)` turns a step's own window into a handle.
+  // Snapshot steps keep their full text; everything else is one line.
+  async runSteps(plan, ctx, call, { stopOnError = true, task = null } = {}) {
     const lines = [];
+    const touched = new Set([ctx.hwnd]);
     let failed = 0;
+    let optionalFailed = 0;
     let stoppedAt = -1;
-    for (let n = 0; n < steps.length; n++) {
-      if (task && task.cancelled) { stoppedAt = n; break; }
-      let parsed;
-      try { parsed = parseStep(steps[n], n + 1); }
-      catch (err) {
-        lines.push(`${n + 1} INVALID: ${err.message}`);
-        failed++;
-        stoppedAt = n + 1;
-        break;
+    let reason = HALT_FAILED;
+    let lastHwnd = ctx.hwnd;
+    let lastTitle = ctx.title;
+
+    for (let i = 0; i < plan.length; i++) {
+      const entry = plan[i];
+      if (task && task.cancelled) { stoppedAt = i; reason = HALT_CANCELLED; break; }
+      const { kind, args, target, optional } = entry;
+
+      // Which window this step acts on. A step with no window of its own runs
+      // on the run's, which is the common case and the old behaviour.
+      let hwnd = ctx.hwnd;
+      let title = ctx.title;
+      let resolveError = null;
+      if (target) {
+        const found = await ctx.resolveWindow(target);
+        if (found.error) resolveError = found.error;
+        else { hwnd = found.hwnd; title = found.title; }
       }
-      const { kind, args } = parsed;
+      let label = stepLabel(entry);
+      if (hwnd !== ctx.hwnd) label += ` in "${title}" (hwnd ${hwnd})`;
+
       const started = Date.now();
       let r;
-      if (kind === 'sleep') {
+      if (resolveError) {
+        r = { text: resolveError, isError: true, code: 'no_window' };
+      } else if (kind === 'sleep') {
         const ms = Math.max(0, Math.min(Number(args.ms) || 0, 30000));
-        await new Promise((res) => setTimeout(res, ms));
-        r = { text: `slept ${ms}ms`, isError: false };
+        // Slept in slices, so cancelling a background run does not have to
+        // wait out a long sleep first.
+        const until = started + ms;
+        while (Date.now() < until) {
+          if (task && task.cancelled) break;
+          await new Promise((res) => setTimeout(res, Math.max(1, Math.min(100, until - Date.now()))));
+        }
+        const slept = Date.now() - started;
+        r = { text: slept < ms ? `slept ${slept}ms of ${ms}ms` : `slept ${ms}ms`, isError: false };
       } else {
+        touched.add(hwnd);
+        lastHwnd = hwnd; lastTitle = title;
         r = await call(kind, { ...args, hwnd });
       }
       const ms = Date.now() - started;
-      const label = `${n + 1} ${describeStep(kind, args)}`;
+
       if (r.isError) {
-        failed++;
-        lines.push(`${label}: FAILED ${briefResult(r.text, 300)}`);
-        if (task) task.lines = lines.slice();
-        if (stopOnError) { stoppedAt = n + 1; break; }
+        // Stop means stop: it is never optional and never continues, whatever
+        // the run asked for.
+        const halted = r.code === 'stopped_by_user';
+        if (optional && !halted) {
+          optionalFailed++;
+          lines.push(`${label}: FAILED (optional, continuing) ${briefResult(r.text, 300)}`);
+        } else {
+          failed++;
+          lines.push(`${label}: FAILED ${briefResult(r.text, 300)}`);
+        }
+        if (task) { task.lines = lines.slice(); task.done = i + 1; }
+        if (halted) { stoppedAt = i + 1; reason = HALT_STOPPED; break; }
+        if (!optional && stopOnError) { stoppedAt = i + 1; reason = HALT_FAILED; break; }
       } else if (kind === 'snapshot') {
         lines.push(`${label}: (${ms}ms)\n${r.text}`);
       } else {
         lines.push(`${label}: ${briefResult(r.text)} (${ms}ms)`);
       }
-      if (task) { task.lines = lines.slice(); task.done = n + 1; }
+      if (task) { task.lines = lines.slice(); task.done = i + 1; }
     }
-    if (stoppedAt >= 0 && stoppedAt < steps.length) {
-      lines.push(`stopped: ${steps.length - stoppedAt} step(s) not run`);
+
+    // Say what did not run, in the caller's own numbering, rather than
+    // leaving the model to work out where the run stopped.
+    if (stoppedAt >= 0 && stoppedAt < plan.length) {
+      const first = plan[stoppedAt].n;
+      const last = plan[plan.length - 1].n;
+      lines.push(`${first === last ? `step ${first}` : `steps ${first}-${last}`}: ${reason}`);
     }
-    return { lines, failed, stoppedAt, ran: stoppedAt >= 0 ? stoppedAt : steps.length };
+    return {
+      lines, failed, optionalFailed, stoppedAt,
+      ran: stoppedAt >= 0 ? stoppedAt : plan.length,
+      lastHwnd, lastTitle, touched,
+    };
   }
 
-  start(steps, hwnd, title, call, opts) {
+  start(plan, ctx, call, opts) {
     const id = 't' + (++this.seq);
     const task = {
-      id, hwnd, title, total: steps.length, done: 0, lines: [], status: 'running',
+      id, hwnd: ctx.hwnd, title: ctx.title, total: plan.length, done: 0, lines: [], status: 'running',
       cancelled: false, startedAt: Date.now(), finishedAt: null, result: null, tail: '',
+      optionalFailed: 0, touched: null,
     };
     this.tasks.set(id, task);
-    task.promise = this.runSteps(steps, hwnd, call, { ...opts, task })
+    task.promise = this.runSteps(plan, ctx, call, { ...opts, task })
       .then(async (r) => {
         task.result = r;
         task.lines = r.lines;
-        if (opts && opts.after) { try { task.tail = await opts.after(); } catch (e) { task.tail = `(no closing read: ${e && e.message})`; } }
+        task.optionalFailed = r.optionalFailed;
+        task.touched = r.touched;
+        if (opts && opts.after) { try { task.tail = await opts.after(r); } catch (e) { task.tail = `(no closing read: ${e && e.message})`; } }
         task.status = task.cancelled ? 'cancelled' : r.failed ? 'failed' : 'done';
       })
       .catch((err) => {
@@ -159,10 +313,13 @@ export class Tasks {
 
   describe(task) {
     const secs = Math.round(((task.finishedAt || Date.now()) - task.startedAt) / 1000);
-    const head = `task ${task.id} on "${task.title}" (hwnd ${task.hwnd}): ${task.status}, ${task.done}/${task.total} steps, ${secs}s`;
+    const head = `task ${task.id} on "${task.title}" (hwnd ${task.hwnd}): ${task.status}, ${task.done}/${task.total} steps, ${secs}s`
+      + (task.optionalFailed ? ` (${task.optionalFailed} optional failed)` : '');
+    const windows = task.touched && task.touched.size > 1
+      ? `\nwindows touched: ${[...task.touched].join(', ')}` : '';
     const body = task.lines.length ? '\n' + task.lines.join('\n') : '';
     const tail = task.tail ? '\n\n' + task.tail : '';
-    return head + body + tail;
+    return head + windows + body + tail;
   }
 
   running() {

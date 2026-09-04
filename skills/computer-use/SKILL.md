@@ -9,19 +9,47 @@ Reads and drives applications through the OS accessibility tree - UI Automation
 on Windows, AXUIElement on macOS. Separate from Claude Code's built-in
 `computer-use` server; on Windows it is the only screen-control path.
 
+## Load the tools
+
+One search loads the loop, and run it again after a compaction (the schemas
+drop, this skill stays):
+
+```
+ToolSearch select:computer_apps,computer_snapshot,computer_grant,computer_run,computer_click
+```
+
+A second search when a task needs them: `computer_type`, `computer_key`,
+`computer_scroll`, `computer_wait_for`, `computer_launch`. A third for
+`computer_task`, `computer_focus`, `computer_close_window`,
+`computer_clipboard`, `computer_screenshot`.
+
 ## The loop
 
 1. `computer_apps` - find the window. Note its `hwnd` and tier. If the app is
    not running, `computer_launch { app: "notepad" }` starts it and returns the
    new window's handle.
-2. `computer_snapshot { hwnd }` - read it. Every element gets an index. Reading
-   never needs a grant and never disturbs anyone.
+2. `computer_snapshot { hwnd }` - read it once. Every element gets an index that
+   stays valid for as long as that control exists. Reading never needs a grant
+   and never disturbs anyone.
 3. `computer_grant { hwnd }` - once per app per session, only to act.
-4. Act by index: `computer_click { index }`,
-   `computer_type { index, text, replace: true }`.
-5. Verify from the action's own result (`Now: ...`, `New window: ...`), or
-   `computer_wait_for` after anything that loads, or a re-read, which costs
-   almost nothing (next section).
+4. `computer_run { hwnd, steps: [...] }` - do the whole next stretch in one
+   call: every click, type, key, scroll and wait you can already name from what
+   you just read. It runs them in order, stops at the first failure, and ends
+   with what changed.
+5. Read that closing delta. Only if the run stopped, or the delta is not what
+   you expected, re-read (`find` is cheapest) or `computer_wait_for`. Then the
+   next run.
+
+**A sequence is the unit of work, not a click.** Going to a URL, filling a
+form, saving a file, walking a menu: each of those is one `computer_run`, not
+four calls. Never send dependent actions as separate calls in one message
+either - they are run in order but they do not stop when one fails, so a click
+that missed is still followed by the typing that needed it.
+
+A single `computer_click`, `computer_type` or `computer_key` is the exception:
+one action whose result you have to see before you can choose the next one - a
+menu whose entries you have not read yet, or a control you must describe to the
+user before a consequential click.
 
 **Indices are stable per window.** An index names the same control for as long
 as that control exists - across reads, after actions, without `snapshot_id`.
@@ -43,10 +71,7 @@ that are the same. `no change since s4 (40 elements, same indices)` costs about
 - `interactive_only: true` - controls only. `text_limit`, `max_nodes`,
   `with_rects` (only for point targeting).
 
-## Several steps in one call
-
-`computer_run { hwnd, steps: [...] }` executes a list of steps, stops at the
-first failure, and ends with the delta since it began:
+## Writing a run
 
 ```
 { click: { index: 5 } }
@@ -56,12 +81,44 @@ first failure, and ends with the delta since it began:
 { scroll: { index: 9, amount: -3 } }
 { snapshot: { find: "Total" } }
 { sleep: 500 }
+{ focus: true }
 { click: { selector: { name: "Send" } }, confirmed: true }
 ```
 
-Each step goes through exactly the same gate as a single call (grant, tier,
-confirmation, the input lease). Use it whenever you already know the next three
-or four actions; one round trip instead of four.
+Short forms: `{ key: "enter" }`, `{ type: "text" }` (no target, so it types
+wherever the focus is), `{ wait_for: "Saved" }`, `{ sleep: 500 }`.
+
+Per-step fields:
+
+- `hwnd` or `title` - run this step on a different window.
+- `window: "new"` - run it on whatever opened during this run. That is how a
+  sequence follows a dialog it just caused: `{ key: "ctrl+s" }`, then
+  `{ type: { text: "notes.txt" }, window: "new" }`, then
+  `{ key: "enter", window: "new" }`.
+- `optional: true` - a failure here does not stop the run. For the step that
+  dismisses a banner that may not be there.
+- `repeat: N` - run this step N times, up to 20. `{ key: "tab", repeat: 4 }`.
+- `confirmed`, `mode`, `physical`, `background` - as on a single call.
+
+Every step goes through exactly the same gate as a single call: grant, tier,
+the send/pay/delete confirmation, the input lease between Claude sessions.
+
+The three rules worth knowing:
+
+- **All steps are checked before the first one runs.** A malformed step means
+  nothing ran at all, so a typo cannot leave a window half-changed.
+- **A run stops at the first failure**, and the steps it never reached are
+  reported as `Not executed`. Fix what failed and send the rest as a new run.
+- **`confirmed: true` is refused in a background run.** A send, a payment or a
+  deletion happens in the foreground, where the user is answering.
+
+The three runs you will write most:
+
+```
+computer_run { hwnd, steps: [ { key: "ctrl+l" }, { type: "https://..." }, { key: "enter" }, { wait_for: { change: true } } ] }
+computer_run { hwnd, steps: [ { type: { index: 4, text: "...", replace: true } }, { click: { index: 9 } }, { wait_for: { text: "Saved" } } ] }
+computer_run { hwnd, steps: [ { key: "ctrl+s" }, { wait_for: { new_window: true } }, { type: { text: "notes.txt" }, window: "new" }, { key: "enter", window: "new" } ] }
+```
 
 `background: true` returns a task id at once so you can go on with other work -
 reading another window, running a Bash command - while the desktop side
@@ -97,14 +154,10 @@ and click with `computer_click`; neither needs the window in front.
 
 ### Go to a URL
 
-```
-computer_key  { hwnd, keys: "ctrl+l" }
-computer_type { hwnd, text: "https://..." }     no index, no replace
-computer_key  { hwnd, keys: "enter" }
-```
-
-Not `replace: true` on the address bar: it is a container that refuses both a
-value and the focus, and returns `focus_failed` every time.
+That is the first run above: `ctrl+l`, type the URL, `enter`, wait for the
+change - one call, not four. Never `replace: true` on the address bar: it is a
+container that refuses both a value and the focus, and returns `focus_failed`
+every time.
 
 ## Targeting, best to worst
 
@@ -169,6 +222,8 @@ reading and pattern parts now and retry the rest later.
 | `another_session_busy` | another Claude session is mid-action; wait and retry |
 | `other_desktop` | the window is on a virtual desktop the user is not looking at; ask them to switch |
 | `blocked_on_screen` | a credential window is in shot; screenshot a specific `hwnd` instead |
+| `invalid_steps` | a step is malformed, so NOTHING ran; fix the steps named in the message and call again |
+| `no_new_window` | a step said `window: "new"` but nothing has opened during this run |
 | `no_task` | no background run exists; start one with `computer_run { background: true }` |
 | `bad_selector` | a selector needs `name`, `automation_id` or `role`, with the role spelled as a snapshot shows it |
 | `stopped_by_user` | they pressed Stop or Escape; every grant is withdrawn - say what you had done and ask before continuing |

@@ -244,7 +244,22 @@ snapshot id and without reading again. `find: "save"` returns only the rows
 that match a word or a `/regex/`; `index: 12` reads one subtree; `full: true`
 asks for the whole listing again.
 
-## Several steps, one call
+## A sequence is one call, not four
+
+Going to a URL is four actions. As four tool calls it is four model turns, and
+Claude Code will not stop the sequence when one of them fails - a click that
+missed is still followed by the typing that needed it. So it is one call:
+
+```
+computer_run { hwnd, steps: [
+  { key: "ctrl+l" },
+  { type: "https://..." },
+  { key: "enter" },
+  { wait_for: { change: true } }
+] }
+```
+
+Five steps on a calculator, one round trip, 822 ms:
 
 ```
 computer_run { hwnd, steps: [
@@ -256,10 +271,22 @@ computer_run { hwnd, steps: [
 ] }
 ```
 
-Six steps, one round trip, 822 ms, and the result ends with the delta since the
-run began. It stops at the first failure and says which steps did not run.
-Every step goes through the same gate a single call would - grant, tier, the
+The result ends with the delta since Claude's last read of that window. Every
+step goes through the same gate a single call would - grant, tier, the
 send/pay/delete confirmation, the input lease between Claude sessions.
+
+Three things make a run safe to reach for by default:
+
+- **Every step is checked before the first one runs.** A malformed step means
+  nothing happened at all, rather than a window left half-changed.
+- **It stops at the first failure**, and names the steps it never reached.
+- **A step can name its own window.** `window: "new"` is whatever opened during
+  the run, so a sequence can follow the Save dialog it just caused instead of
+  ending at it. `optional: true` lets a step fail without stopping the run, and
+  `repeat: N` runs one step N times.
+
+A `confirmed: true` step is refused in a background run: a send, a payment or a
+deletion happens in the foreground, where you are there to answer.
 
 `background: true` returns a task id at once. Claude goes on reading another
 window or running a shell command while the desktop side proceeds;
@@ -310,8 +337,8 @@ you can read in `server/native/`. Nothing is downloaded.
 computer_apps                                find the window, note its hwnd
 computer_snapshot { hwnd }                   read it, every element gets an index
 computer_grant { hwnd }                      needed to act, never to read
-computer_click { index: 12 }
-computer_type { index: 5, text: "...", replace: true }
+computer_run { hwnd, steps: [...] }           every stretch of known actions, one call
+computer_click { index: 12 }                 one action whose result you must see first
 computer_clipboard                           read it; { text } sets it
 ```
 
@@ -365,7 +392,9 @@ result says `exclusive_unavailable`. Escape releases it regardless. It is
 opt-in and never the default, precisely because a locked-out user cannot reach
 the Stop button — Escape is why it is safe to offer at all.
 
-Sixteen tools, about **2,300 tokens** of always-on cost. One screenshot you did
+Sixteen tool names and a short server note are the always-on cost, about
+**340 tokens**; the schemas load on first use (about 2,400) and again after a
+compaction. One screenshot you did
 not take pays for that four times over.
 
 ### Clipboard

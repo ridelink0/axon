@@ -232,7 +232,7 @@ async function main() {
     { click: { selector: { automation_id: 'nope' } } },
     { click: { index: iPress } },
   ] }));
-  check('run stops at the first failure', run2.includes('FAILED') && run2.includes('1 step(s) not run'), run2);
+  check('run stops at the first failure', run2.includes('FAILED') && /Not executed: an earlier computer action/.test(run2), run2);
   const run3 = body(await c.call('computer_run', { hwnd, read_after: false, stop_on_error: false, steps: [
     { click: { selector: { automation_id: 'nope' } } },
     { click: { index: iPress } },
